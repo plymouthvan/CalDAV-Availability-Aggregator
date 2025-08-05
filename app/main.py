@@ -36,6 +36,7 @@ def load_configuration() -> Dict[str, Any]:
         "google_client_id": os.getenv("GOOGLE_CLIENT_ID"),
         "google_client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
         "encryption_key": os.getenv("ENCRYPTION_KEY"),
+        "google_calendar_id": os.getenv("GOOGLE_CALENDAR_ID", "primary"),
         "sources": []
     }
 
@@ -86,7 +87,10 @@ async def main():
             encryption_key=config["encryption_key"],
             database=db
         )
-        google_client = GoogleClient(oauth_handler=oauth_handler)
+        google_client = GoogleClient(
+            oauth_handler=oauth_handler,
+            calendar_id=config["google_calendar_id"]
+        )
         
         # Ensure Google authentication is working
         access_token = await oauth_handler.get_access_token()

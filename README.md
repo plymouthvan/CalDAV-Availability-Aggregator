@@ -45,6 +45,10 @@ CalDAV Mirror is a headless background service that aggregates events from one o
     # A 32-byte random string for encrypting tokens.
     # Generate one with: openssl rand -hex 32
     ENCRYPTION_KEY=your-super-secret-32-byte-encryption-key
+
+    # ID of the Google Calendar to sync to. Defaults to "primary".
+    # Find this in your Google Calendar settings.
+    GOOGLE_CALENDAR_ID=primary
     ```
 
 4. Configure `sources.yml`. See below.

@@ -40,16 +40,6 @@ class CalDAVClient:
         self._auth = aiohttp.BasicAuth(username, password)
         self._session: Optional[aiohttp.ClientSession] = None
     
-    async def __aenter__(self):
-        """Async context manager entry."""
-        self._session = aiohttp.ClientSession(auth=self._auth)
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
-        if self._session:
-            await self._session.close()
-    
     async def discover_calendars(self) -> List[Dict[str, str]]:
         """
         Discover available calendars on the CalDAV server.
@@ -75,15 +65,16 @@ class CalDAVClient:
         }
         
         try:
-            async with self._session.request(
-                'PROPFIND', self.url, data=propfind_body, headers=headers
-            ) as response:
-                if response.status not in [200, 207]:
-                    logger.error(f"Calendar discovery failed: {response.status}")
-                    return []
-                
-                xml_content = await response.text()
-                return self._parse_calendar_discovery(xml_content)
+            async with aiohttp.ClientSession(auth=self._auth) as session:
+                async with session.request(
+                    'PROPFIND', self.url, data=propfind_body, headers=headers
+                ) as response:
+                    if response.status not in [200, 207]:
+                        logger.error(f"Calendar discovery failed: {response.status}")
+                        return []
+                    
+                    xml_content = await response.text()
+                    return self._parse_calendar_discovery(xml_content)
                 
         except Exception as e:
             logger.error(f"Calendar discovery error: {e}")
@@ -198,23 +189,24 @@ class CalDAVClient:
         }
         
         try:
-            async with self._session.request(
-                'REPORT', self.url, data=sync_body, headers=headers
-            ) as response:
-                if response.status not in [200, 207]:
-                    logger.error(f"Sync-token sync failed: {response.status}")
-                    return [], []
-                
-                xml_content = await response.text()
-                events, deleted_uids, new_sync_token = self._parse_sync_collection_response(xml_content)
-                
-                # Update sync state
-                if new_sync_token and self.database:
-                    await self.database.update_sync_state(
-                        self.name, 'sync-token', sync_token=new_sync_token
-                    )
-                
-                return events, deleted_uids
+            async with aiohttp.ClientSession(auth=self._auth) as session:
+                async with session.request(
+                    'REPORT', self.url, data=sync_body, headers=headers
+                ) as response:
+                    if response.status not in [200, 207]:
+                        logger.error(f"Sync-token sync failed: {response.status}")
+                        return [], []
+                    
+                    xml_content = await response.text()
+                    events, deleted_uids, new_sync_token = self._parse_sync_collection_response(xml_content)
+                    
+                    # Update sync state
+                    if new_sync_token and self.database:
+                        await self.database.update_sync_state(
+                            self.name, 'sync-token', sync_token=new_sync_token
+                        )
+                    
+                    return events, deleted_uids
                 
         except Exception as e:
             logger.error(f"Sync-token sync error: {e}")
@@ -240,33 +232,34 @@ class CalDAVClient:
         }
         
         try:
-            async with self._session.request(
-                'PROPFIND', self.url, data=propfind_body, headers=headers
-            ) as response:
-                if response.status not in [200, 207]:
-                    logger.error(f"CTag fetch failed: {response.status}")
-                    return [], []
-                
-                xml_content = await response.text()
-                new_ctag = self._parse_ctag_response(xml_content)
-                
-                if new_ctag == current_ctag:
-                    logger.info(f"No changes detected for {self.name} (ctag unchanged)")
-                    return [], []
-                
-                # CTag changed, fetch all events
-                events = await self._fetch_all_events()
-                
-                # Update sync state
-                if self.database:
-                    await self.database.update_sync_state(
-                        self.name, 'ctag', ctag=new_ctag
-                    )
-                
-                # For ctag, we need to compare with existing events to find deletions
-                deleted_uids = await self._find_deleted_events(events)
-                
-                return events, deleted_uids
+            async with aiohttp.ClientSession(auth=self._auth) as session:
+                async with session.request(
+                    'PROPFIND', self.url, data=propfind_body, headers=headers
+                ) as response:
+                    if response.status not in [200, 207]:
+                        logger.error(f"CTag fetch failed: {response.status}")
+                        return [], []
+                    
+                    xml_content = await response.text()
+                    new_ctag = self._parse_ctag_response(xml_content)
+                    
+                    if new_ctag == current_ctag:
+                        logger.info(f"No changes detected for {self.name} (ctag unchanged)")
+                        return [], []
+                    
+                    # CTag changed, fetch all events
+                    events = await self._fetch_all_events()
+                    
+                    # Update sync state
+                    if self.database:
+                        await self.database.update_sync_state(
+                            self.name, 'ctag', ctag=new_ctag
+                        )
+                    
+                    # For ctag, we need to compare with existing events to find deletions
+                    deleted_uids = await self._find_deleted_events(events)
+                    
+                    return events, deleted_uids
                 
         except Exception as e:
             logger.error(f"CTag sync error: {e}")
@@ -373,15 +366,16 @@ class CalDAVClient:
         events = []
         
         try:
-            async with self._session.request(
-                'REPORT', self.url, data=calendar_query_body, headers=headers
-            ) as response:
-                if response.status not in [200, 207]:
-                    logger.error(f"Calendar query failed: {response.status}")
-                    return events
-                
-                xml_content = await response.text()
-                events = self._parse_calendar_query_response(xml_content)
+            async with aiohttp.ClientSession(auth=self._auth) as session:
+                async with session.request(
+                    'REPORT', self.url, data=calendar_query_body, headers=headers
+                ) as response:
+                    if response.status not in [200, 207]:
+                        logger.error(f"Calendar query failed: {response.status}")
+                        return events
+                    
+                    xml_content = await response.text()
+                    events = self._parse_calendar_query_response(xml_content)
                 
         except Exception as e:
             logger.error(f"Failed to fetch all events: {e}")
@@ -443,8 +437,9 @@ class CalDAVClient:
     async def test_connection(self) -> bool:
         """Test connection to CalDAV server."""
         try:
-            async with self._session.options(self.url) as response:
-                return response.status < 400
+            async with aiohttp.ClientSession(auth=self._auth) as session:
+                async with session.options(self.url) as response:
+                    return response.status < 400
         except Exception as e:
             logger.error(f"Connection test failed for {self.name}: {e}")
             return False

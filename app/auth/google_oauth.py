@@ -27,8 +27,7 @@ class GoogleOAuth:
     
     # Required scopes for Google Calendar
     SCOPES = [
-        "https://www.googleapis.com/auth/calendar",
-        "https://www.googleapis.com/auth/calendar.events"
+        "https://www.googleapis.com/auth/calendar"
     ]
     
     def __init__(self, client_id: str, client_secret: str, encryption_key: str, database=None):
@@ -144,7 +143,8 @@ class GoogleOAuth:
                 if response.status == 200:
                     return await response.json()
                 else:
-                    logger.error(f"Failed to request device code: {response.status}")
+                    error_text = await response.text()
+                    logger.error(f"Failed to request device code: {response.status} - {error_text}")
                     return None
     
     async def _poll_for_token(self, device_code: str) -> Optional[Dict[str, Any]]:

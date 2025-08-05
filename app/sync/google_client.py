@@ -26,16 +26,6 @@ class GoogleClient:
         self.calendar_id = calendar_id
         self._session: Optional[aiohttp.ClientSession] = None
 
-    async def __aenter__(self):
-        """Async context manager entry."""
-        self._session = aiohttp.ClientSession()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
-        if self._session:
-            await self._session.close()
-
     async def _get_auth_headers(self) -> Dict[str, str]:
         """Get authorization headers with a valid access token."""
         access_token = await self.oauth.get_access_token()
@@ -61,19 +51,20 @@ class GoogleClient:
         google_event_data = event.to_google_event()
 
         try:
-            async with self._session.post(
-                url, json=google_event_data, headers=headers
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    logger.info(f"Successfully created Google event ID: {data['id']}")
-                    return data["id"]
-                else:
-                    error_text = await response.text()
-                    logger.error(
-                        f"Failed to create Google event: {response.status} - {error_text}"
-                    )
-                    return None
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=google_event_data, headers=headers
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        logger.info(f"Successfully created Google event ID: {data['id']}")
+                        return data["id"]
+                    else:
+                        error_text = await response.text()
+                        logger.error(
+                            f"Failed to create Google event: {response.status} - {error_text}"
+                        )
+                        return None
         except Exception as e:
             logger.error(f"Error creating Google event: {e}", exc_info=True)
             return None
@@ -97,18 +88,19 @@ class GoogleClient:
         google_event_data = event.to_google_event()
 
         try:
-            async with self._session.put(
-                url, json=google_event_data, headers=headers
-            ) as response:
-                if response.status == 200:
-                    logger.info(f"Successfully updated Google event ID: {google_event_id}")
-                    return True
-                else:
-                    error_text = await response.text()
-                    logger.error(
-                        f"Failed to update Google event: {response.status} - {error_text}"
-                    )
-                    return False
+            async with aiohttp.ClientSession() as session:
+                async with session.put(
+                    url, json=google_event_data, headers=headers
+                ) as response:
+                    if response.status == 200:
+                        logger.info(f"Successfully updated Google event ID: {google_event_id}")
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.error(
+                            f"Failed to update Google event: {response.status} - {error_text}"
+                        )
+                        return False
         except Exception as e:
             logger.error(f"Error updating Google event: {e}", exc_info=True)
             return False
@@ -128,19 +120,20 @@ class GoogleClient:
         headers = await self._get_auth_headers()
 
         try:
-            async with self._session.delete(url, headers=headers) as response:
-                if response.status == 204:
-                    logger.info(f"Successfully deleted Google event ID: {google_event_id}")
-                    return True
-                elif response.status == 410: # Gone, already deleted
-                    logger.warning(f"Google event ID {google_event_id} was already deleted.")
-                    return True
-                else:
-                    error_text = await response.text()
-                    logger.error(
-                        f"Failed to delete Google event: {response.status} - {error_text}"
-                    )
-                    return False
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(url, headers=headers) as response:
+                    if response.status == 204:
+                        logger.info(f"Successfully deleted Google event ID: {google_event_id}")
+                        return True
+                    elif response.status == 410: # Gone, already deleted
+                        logger.warning(f"Google event ID {google_event_id} was already deleted.")
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.error(
+                            f"Failed to delete Google event: {response.status} - {error_text}"
+                        )
+                        return False
         except Exception as e:
             logger.error(f"Error deleting Google event: {e}", exc_info=True)
             return False
@@ -160,18 +153,19 @@ class GoogleClient:
         headers = await self._get_auth_headers()
 
         try:
-            async with self._session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    return await response.json()
-                elif response.status == 404:
-                    logger.info(f"Google event ID {google_event_id} not found.")
-                    return None
-                else:
-                    error_text = await response.text()
-                    logger.error(
-                        f"Failed to get Google event: {response.status} - {error_text}"
-                    )
-                    return None
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    elif response.status == 404:
+                        logger.info(f"Google event ID {google_event_id} not found.")
+                        return None
+                    else:
+                        error_text = await response.text()
+                        logger.error(
+                            f"Failed to get Google event: {response.status} - {error_text}"
+                        )
+                        return None
         except Exception as e:
             logger.error(f"Error getting Google event: {e}", exc_info=True)
             return None
