@@ -13,6 +13,8 @@ import argparse
 import logging
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
+import yaml
+from pathlib import Path
 
 # --- Basic Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -118,21 +120,44 @@ async def parse_propfind_response(xml_content: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Check a CalDAV server for supported synchronization features."
+        description="Check all CalDAV servers in sources.yml for supported synchronization features."
     )
-    parser.add_argument("url", help="The full URL of the CalDAV calendar.")
-    parser.add_argument("-u", "--username", required=True, help="Your CalDAV username.")
-    parser.add_argument("-p", "--password", required=True, help="Your CalDAV password.")
-    
-    args = parser.parse_args()
+    parser.parse_args()
 
-    # Basic URL validation
-    parsed_url = urlparse(args.url)
-    if not all([parsed_url.scheme, parsed_url.netloc]):
-        logging.error("Invalid URL provided. Please include the scheme (e.g., https://).")
+    # Load sources.yml
+    sources_path = Path("sources.yml")
+    if not sources_path.exists():
+        logging.error("sources.yml not found.")
         return
 
-    asyncio.run(check_capabilities(args.url, args.username, args.password))
+    with open(sources_path, 'r') as f:
+        sources_data = yaml.safe_load(f)
+        if not sources_data:
+            logging.error("sources.yml is empty or malformed.")
+            return
+
+    async def run_all_checks():
+        for source in sources_data:
+            name = source.get("name", "Unnamed Source")
+            url = source.get("url")
+            username = source.get("username")
+            password = source.get("password")
+
+            if not all([url, username, password]):
+                logging.error(f"Source '{name}' is missing url, username, or password.")
+                continue
+
+            print(f"\n--- Checking Source: {name} ---")
+            
+            # Basic URL validation
+            parsed_url = urlparse(url)
+            if not all([parsed_url.scheme, parsed_url.netloc]):
+                logging.error(f"Invalid URL for source '{name}'. Please include the scheme (e.g., https://).")
+                continue
+
+            await check_capabilities(url, username, password)
+
+    asyncio.run(run_all_checks())
 
 
 if __name__ == "__main__":

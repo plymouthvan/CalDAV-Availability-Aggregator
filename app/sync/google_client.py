@@ -186,7 +186,7 @@ class GoogleClient:
             return {}
 
         logger.info(f"Batch creating {len(events)} Google events...")
-        batch_url = f"{self.API_BASE_URL}/batch"
+        batch_url = "https://www.googleapis.com/batch/calendar/v3"
         headers = await self._get_auth_headers()
         headers["Content-Type"] = "multipart/mixed; boundary=batch_boundary"
 

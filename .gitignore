@@ -79,3 +79,4 @@ data/
 
 # Docker-related files
 docker-compose.override.yml
+tests/

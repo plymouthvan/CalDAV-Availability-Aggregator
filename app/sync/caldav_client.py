@@ -160,28 +160,17 @@ class CalDAVClient:
         sync_state = await self.database.get_sync_state(self.name) if self.database else None
         sync_token = sync_state.get('sync_token') if sync_state else None
         
-        # Build sync-collection REPORT request
-        if sync_token:
-            sync_body = f'''<?xml version="1.0" encoding="utf-8" ?>
-            <D:sync-collection xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-                <D:sync-token>{sync_token}</D:sync-token>
-                <D:sync-level>1</D:sync-level>
-                <D:prop>
-                    <D:getetag />
-                    <C:calendar-data />
-                </D:prop>
-            </D:sync-collection>'''
-        else:
-            # Initial sync
-            sync_body = '''<?xml version="1.0" encoding="utf-8" ?>
-            <D:sync-collection xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-                <D:sync-token />
-                <D:sync-level>1</D:sync-level>
-                <D:prop>
-                    <D:getetag />
-                    <C:calendar-data />
-                </D:prop>
-            </D:sync-collection>'''
+        # Build calendar-query REPORT request
+        sync_body = """<?xml version="1.0" encoding="utf-8" ?>
+        <C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+            <D:prop>
+                <D:getetag />
+                <C:calendar-data />
+            </D:prop>
+            <C:filter>
+                <C:comp-filter name="VCALENDAR" />
+            </C:filter>
+        </C:calendar-query>"""
         
         headers = {
             'Content-Type': 'application/xml; charset=utf-8',
@@ -198,7 +187,7 @@ class CalDAVClient:
                         return [], []
                     
                     xml_content = await response.text()
-                    events, deleted_uids, new_sync_token = self._parse_sync_collection_response(xml_content)
+                    events, deleted_uids, new_sync_token = await self._parse_sync_collection_response(xml_content)
                     
                     new_sync_state = None
                     if new_sync_token:
@@ -246,12 +235,9 @@ class CalDAVClient:
                         return [], [], None
                     
                     # CTag changed, fetch all events
-                    events = await self._fetch_all_events()
+                    events, deleted_uids, _ = await self._sync_with_sync_token()
                     
                     new_sync_state = {"ctag": new_ctag}
-                    
-                    # For ctag, we need to compare with existing events to find deletions
-                    deleted_uids = await self._find_deleted_events(events)
                     
                     return events, deleted_uids, new_sync_state
                 
@@ -266,59 +252,80 @@ class CalDAVClient:
         logger.warning(f"GTag sync not yet implemented for {self.name}")
         return [], [], None
     
-    def _parse_sync_collection_response(self, xml_content: str) -> Tuple[List[EventModel], List[str], Optional[str]]:
+    async def _parse_sync_collection_response(self, xml_content: str) -> Tuple[List[EventModel], List[str], Optional[str]]:
         """Parse sync-collection REPORT response."""
         events = []
         deleted_uids = []
         sync_token = None
-        
+        event_urls_to_fetch = []
+
         try:
             root = ET.fromstring(xml_content)
+            namespaces = {'D': 'DAV:', 'C': 'urn:ietf:params:xml:ns:caldav'}
             
-            namespaces = {
-                'D': 'DAV:',
-                'C': 'urn:ietf:params:xml:ns:caldav'
-            }
-            
-            # Extract new sync token
             sync_token_elem = root.find('.//D:sync-token', namespaces)
             if sync_token_elem is not None:
                 sync_token = sync_token_elem.text
-            
-            # Process responses
+
             for response in root.findall('.//D:response', namespaces):
                 href = response.find('D:href', namespaces)
                 if href is None:
                     continue
-                
+
                 status = response.find('.//D:status', namespaces)
                 if status is None:
                     continue
-                
-                status_code = status.text
-                
-                if '404' in status_code:
-                    # Deleted resource
+
+                if '404' in status.text:
                     resource_uid = self._extract_uid_from_href(href.text)
                     if resource_uid:
                         deleted_uids.append(resource_uid)
-                elif '200' in status_code:
-                    # Updated/new resource
+                elif '200' in status.text:
                     calendar_data = response.find('.//C:calendar-data', namespaces)
                     if calendar_data is not None and calendar_data.text:
                         try:
                             cal = Calendar.from_ical(calendar_data.text)
                             for component in cal.walk():
                                 if component.name == "VEVENT":
-                                    event = EventModel.from_icalendar(component)
-                                    events.append(event)
+                                    events.append(EventModel.from_icalendar(component))
                         except Exception as e:
                             logger.error(f"Failed to parse calendar data: {e}")
-            
+                    else:
+                        event_urls_to_fetch.append(urljoin(self.url, href.text))
+
         except ET.ParseError as e:
             logger.error(f"Failed to parse sync-collection response: {e}")
-        
+
+        if event_urls_to_fetch:
+            fetched_events = await self._fetch_event_data(event_urls_to_fetch)
+            events.extend(fetched_events)
+
         return events, deleted_uids, sync_token
+
+    async def _fetch_event_data(self, urls: List[str]) -> List[EventModel]:
+        """Fetch and parse iCalendar data from a list of URLs."""
+        events = []
+        tasks = [self._fetch_and_parse_event(url) for url in urls]
+        results = await asyncio.gather(*tasks)
+        for result in results:
+            if result:
+                events.append(result)
+        return events
+
+    async def _fetch_and_parse_event(self, url: str) -> Optional[EventModel]:
+        """Fetch and parse a single iCalendar event."""
+        try:
+            async with aiohttp.ClientSession(auth=self._auth) as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        event_text = await response.text()
+                        cal = Calendar.from_ical(event_text)
+                        for component in cal.walk():
+                            if component.name == "VEVENT":
+                                return EventModel.from_icalendar(component)
+        except Exception as e:
+            logger.error(f"Failed to fetch event data from {url}: {e}")
+        return None
     
     def _parse_ctag_response(self, xml_content: str) -> Optional[str]:
         """Parse PROPFIND response to extract ctag."""

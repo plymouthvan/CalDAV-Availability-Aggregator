@@ -21,4 +21,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY ./app /app
 
 # Set the entrypoint for the container
-ENTRYPOINT ["python", "main.py"]
+ENTRYPOINT ["python3", "main.py"]

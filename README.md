@@ -112,23 +112,36 @@ SQLite is used for persistence. All synced events are stored with:
 - No calendar browsing
 - No two-way sync
 
-## 🧪 Validating a CalDAV Source
+## 🛠️ Tools
 
-Before configuring `sources.yml`, you need to know which sync method your CalDAV server supports. This repository includes a `capabilities.py` script to help you find out.
+This project includes several command-line tools to help you manage and diagnose your sync configuration.
 
-1.  **Install dependencies locally:**
-    ```bash
-    pip install -r requirements.txt
-    ```
+### `capabilities.py`
 
-2.  **Run the script:**
-    ```bash
-    python capabilities.py https://your-caldav-server.com/path/to/calendar/ \
-      --username "your-username" \
-      --password "your-password"
-    ```
+This tool checks all sources in your `sources.yml` file to determine the best available synchronization method.
 
-The script will output the recommended `sync_method` to use for that source in your `sources.yml` file. The most efficient method is `sync-token`, followed by `ctag`.
+**Usage:**
+```bash
+docker compose -f docker/docker-compose.yml run --rm --entrypoint python3 caldav-mirror tools/capabilities.py
+```
+
+### `test_source.py`
+
+This tool performs a "dry run" of the sync process for a single source. It will connect to the CalDAV server, fetch events, and parse them, but it will **not** make any changes to your Google Calendar or the local database. This is useful for debugging connection or parsing issues.
+
+**Usage:**
+```bash
+docker compose -f docker/docker-compose.yml run --rm --entrypoint python3 caldav-mirror tools/test_source.py "Your Source Name"
+```
+
+### `source_cleanup.py`
+
+This tool will remove all data associated with a specific source, including all of its events from Google Calendar and the local database. This is useful if you want to remove a source and its synced data permanently.
+
+**Usage:**
+```bash
+docker compose -f docker/docker-compose.yml run --rm --entrypoint python3 caldav-mirror tools/source_cleanup.py "Your Source Name"
+```
 
 ## 💬 License
 
