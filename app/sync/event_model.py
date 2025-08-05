@@ -1,0 +1,337 @@
+"""
+Event model for CalDAV Mirror
+
+Provides normalized event representation and hashing for deduplication.
+"""
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
+from dataclasses import dataclass, asdict
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EventModel:
+    """Normalized event representation."""
+    
+    # Core identifiers
+    uid: str                    # CalDAV UID
+    summary: str               # Event title
+    description: Optional[str] = None
+    
+    # Time information
+    start_datetime: Optional[datetime] = None
+    end_datetime: Optional[datetime] = None
+    start_date: Optional[str] = None  # For all-day events (YYYY-MM-DD)
+    end_date: Optional[str] = None    # For all-day events (YYYY-MM-DD)
+    timezone: Optional[str] = None
+    
+    # Location and organizer
+    location: Optional[str] = None
+    organizer: Optional[str] = None
+    organizer_email: Optional[str] = None
+    
+    # Event properties
+    status: str = "CONFIRMED"  # CONFIRMED, TENTATIVE, CANCELLED
+    transparency: str = "OPAQUE"  # OPAQUE, TRANSPARENT
+    
+    # Recurrence
+    rrule: Optional[str] = None
+    recurrence_id: Optional[str] = None
+    
+    # Attendees
+    attendees: List[Dict[str, str]] = None
+    
+    # Metadata
+    created: Optional[datetime] = None
+    last_modified: Optional[datetime] = None
+    sequence: int = 0
+    
+    # Categories and classification
+    categories: List[str] = None
+    classification: str = "PUBLIC"  # PUBLIC, PRIVATE, CONFIDENTIAL
+    
+    def __post_init__(self):
+        """Initialize default values for mutable fields."""
+        if self.attendees is None:
+            self.attendees = []
+        if self.categories is None:
+            self.categories = []
+    
+    @classmethod
+    def from_icalendar(cls, ical_event) -> 'EventModel':
+        """
+        Create EventModel from an icalendar Event component.
+        
+        Args:
+            ical_event: icalendar Event component
+            
+        Returns:
+            EventModel instance
+        """
+        try:
+            # Extract basic properties
+            uid = str(ical_event.get('UID', ''))
+            summary = str(ical_event.get('SUMMARY', ''))
+            description = str(ical_event.get('DESCRIPTION', '')) if ical_event.get('DESCRIPTION') else None
+            
+            # Handle datetime/date fields
+            start_datetime = None
+            end_datetime = None
+            start_date = None
+            end_date = None
+            event_timezone = None
+            
+            dtstart = ical_event.get('DTSTART')
+            dtend = ical_event.get('DTEND')
+            
+            if dtstart:
+                if hasattr(dtstart.dt, 'date'):
+                    # It's a datetime
+                    start_datetime = dtstart.dt
+                    if hasattr(dtstart.dt, 'tzinfo') and dtstart.dt.tzinfo:
+                        event_timezone = str(dtstart.dt.tzinfo)
+                else:
+                    # It's a date (all-day event)
+                    start_date = dtstart.dt.strftime('%Y-%m-%d')
+            
+            if dtend:
+                if hasattr(dtend.dt, 'date'):
+                    # It's a datetime
+                    end_datetime = dtend.dt
+                else:
+                    # It's a date (all-day event)
+                    end_date = dtend.dt.strftime('%Y-%m-%d')
+            
+            # Location and organizer
+            location = str(ical_event.get('LOCATION', '')) if ical_event.get('LOCATION') else None
+            
+            organizer = None
+            organizer_email = None
+            if ical_event.get('ORGANIZER'):
+                organizer_prop = ical_event.get('ORGANIZER')
+                organizer_email = str(organizer_prop).replace('mailto:', '') if str(organizer_prop).startswith('mailto:') else str(organizer_prop)
+                organizer = organizer_prop.params.get('CN', organizer_email) if hasattr(organizer_prop, 'params') else organizer_email
+            
+            # Status and transparency
+            status = str(ical_event.get('STATUS', 'CONFIRMED')).upper()
+            transparency = str(ical_event.get('TRANSP', 'OPAQUE')).upper()
+            
+            # Recurrence
+            rrule = str(ical_event.get('RRULE', '')) if ical_event.get('RRULE') else None
+            recurrence_id = str(ical_event.get('RECURRENCE-ID', '')) if ical_event.get('RECURRENCE-ID') else None
+            
+            # Attendees
+            attendees = []
+            for attendee in ical_event.get('ATTENDEE', []):
+                if not isinstance(attendee, list):
+                    attendee = [attendee]
+                
+                for att in attendee:
+                    att_email = str(att).replace('mailto:', '') if str(att).startswith('mailto:') else str(att)
+                    att_name = att.params.get('CN', att_email) if hasattr(att, 'params') else att_email
+                    att_status = att.params.get('PARTSTAT', 'NEEDS-ACTION') if hasattr(att, 'params') else 'NEEDS-ACTION'
+                    
+                    attendees.append({
+                        'email': att_email,
+                        'name': att_name,
+                        'status': att_status
+                    })
+            
+            # Metadata
+            created = ical_event.get('CREATED').dt if ical_event.get('CREATED') else None
+            last_modified = ical_event.get('LAST-MODIFIED').dt if ical_event.get('LAST-MODIFIED') else None
+            sequence = int(ical_event.get('SEQUENCE', 0))
+            
+            # Categories
+            categories = []
+            if ical_event.get('CATEGORIES'):
+                cats = ical_event.get('CATEGORIES')
+                if isinstance(cats, list):
+                    categories = [str(cat) for cat in cats]
+                else:
+                    categories = [str(cats)]
+            
+            classification = str(ical_event.get('CLASS', 'PUBLIC')).upper()
+            
+            return cls(
+                uid=uid,
+                summary=summary,
+                description=description,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                start_date=start_date,
+                end_date=end_date,
+                timezone=event_timezone,
+                location=location,
+                organizer=organizer,
+                organizer_email=organizer_email,
+                status=status,
+                transparency=transparency,
+                rrule=rrule,
+                recurrence_id=recurrence_id,
+                attendees=attendees,
+                created=created,
+                last_modified=last_modified,
+                sequence=sequence,
+                categories=categories,
+                classification=classification
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to parse iCalendar event: {e}")
+            # Return minimal event to avoid complete failure
+            return cls(
+                uid=str(ical_event.get('UID', 'unknown')),
+                summary=str(ical_event.get('SUMMARY', 'Untitled Event'))
+            )
+    
+    def to_google_event(self) -> Dict[str, Any]:
+        """
+        Convert to Google Calendar API event format.
+        
+        Returns:
+            Dictionary in Google Calendar API format
+        """
+        google_event = {
+            'summary': self.summary,
+            'status': self._map_status_to_google(),
+            'transparency': self._map_transparency_to_google(),
+        }
+        
+        # Description
+        if self.description:
+            google_event['description'] = self.description
+        
+        # Location
+        if self.location:
+            google_event['location'] = self.location
+        
+        # Organizer
+        if self.organizer_email:
+            google_event['organizer'] = {
+                'email': self.organizer_email,
+                'displayName': self.organizer or self.organizer_email
+            }
+        
+        # Time handling
+        if self.start_date and self.end_date:
+            # All-day event
+            google_event['start'] = {'date': self.start_date}
+            google_event['end'] = {'date': self.end_date}
+        elif self.start_datetime and self.end_datetime:
+            # Timed event
+            google_event['start'] = {
+                'dateTime': self.start_datetime.isoformat(),
+                'timeZone': self.timezone or 'UTC'
+            }
+            google_event['end'] = {
+                'dateTime': self.end_datetime.isoformat(),
+                'timeZone': self.timezone or 'UTC'
+            }
+        
+        # Recurrence
+        if self.rrule:
+            google_event['recurrence'] = [f'RRULE:{self.rrule}']
+        
+        # Attendees
+        if self.attendees:
+            google_event['attendees'] = [
+                {
+                    'email': att['email'],
+                    'displayName': att['name'],
+                    'responseStatus': self._map_attendee_status_to_google(att['status'])
+                }
+                for att in self.attendees
+            ]
+        
+        # Visibility
+        if self.classification == 'PRIVATE':
+            google_event['visibility'] = 'private'
+        elif self.classification == 'CONFIDENTIAL':
+            google_event['visibility'] = 'confidential'
+        else:
+            google_event['visibility'] = 'default'
+        
+        return google_event
+    
+    def _map_status_to_google(self) -> str:
+        """Map CalDAV status to Google Calendar status."""
+        status_map = {
+            'CONFIRMED': 'confirmed',
+            'TENTATIVE': 'tentative',
+            'CANCELLED': 'cancelled'
+        }
+        return status_map.get(self.status, 'confirmed')
+    
+    def _map_transparency_to_google(self) -> str:
+        """Map CalDAV transparency to Google Calendar transparency."""
+        return 'transparent' if self.transparency == 'TRANSPARENT' else 'opaque'
+    
+    def _map_attendee_status_to_google(self, caldav_status: str) -> str:
+        """Map CalDAV attendee status to Google Calendar status."""
+        status_map = {
+            'ACCEPTED': 'accepted',
+            'DECLINED': 'declined',
+            'TENTATIVE': 'tentative',
+            'NEEDS-ACTION': 'needsAction'
+        }
+        return status_map.get(caldav_status, 'needsAction')
+    
+    def compute_hash(self) -> str:
+        """
+        Compute a hash of the event for deduplication.
+        
+        Returns:
+            SHA-256 hash of normalized event data
+        """
+        # Create a normalized representation for hashing
+        hash_data = {
+            'uid': self.uid,
+            'summary': self.summary,
+            'description': self.description,
+            'start_datetime': self.start_datetime.isoformat() if self.start_datetime else None,
+            'end_datetime': self.end_datetime.isoformat() if self.end_datetime else None,
+            'start_date': self.start_date,
+            'end_date': self.end_date,
+            'timezone': self.timezone,
+            'location': self.location,
+            'organizer_email': self.organizer_email,
+            'status': self.status,
+            'transparency': self.transparency,
+            'rrule': self.rrule,
+            'recurrence_id': self.recurrence_id,
+            'attendees': sorted(self.attendees, key=lambda x: x['email']) if self.attendees else [],
+            'sequence': self.sequence,
+            'categories': sorted(self.categories) if self.categories else [],
+            'classification': self.classification
+        }
+        
+        # Convert to JSON string with sorted keys for consistent hashing
+        json_str = json.dumps(hash_data, sort_keys=True, default=str)
+        
+        # Return SHA-256 hash
+        return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary representation."""
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'EventModel':
+        """Create EventModel from dictionary."""
+        # Handle datetime fields
+        if data.get('start_datetime') and isinstance(data['start_datetime'], str):
+            data['start_datetime'] = datetime.fromisoformat(data['start_datetime'])
+        if data.get('end_datetime') and isinstance(data['end_datetime'], str):
+            data['end_datetime'] = datetime.fromisoformat(data['end_datetime'])
+        if data.get('created') and isinstance(data['created'], str):
+            data['created'] = datetime.fromisoformat(data['created'])
+        if data.get('last_modified') and isinstance(data['last_modified'], str):
+            data['last_modified'] = datetime.fromisoformat(data['last_modified'])
+        
+        return cls(**data)
