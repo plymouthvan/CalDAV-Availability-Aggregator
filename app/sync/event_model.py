@@ -50,6 +50,7 @@ class EventModel:
     created: Optional[datetime] = None
     last_modified: Optional[datetime] = None
     sequence: int = 0
+    source_name: Optional[str] = None
     
     # Categories and classification
     categories: List[str] = None
@@ -59,16 +60,22 @@ class EventModel:
         """Initialize default values for mutable fields."""
         if self.attendees is None:
             self.attendees = []
+        else:
+            self.attendees = sorted(self.attendees, key=lambda x: x['email'])
+            
         if self.categories is None:
             self.categories = []
+        else:
+            self.categories = sorted(self.categories)
     
     @classmethod
-    def from_icalendar(cls, ical_event) -> 'EventModel':
+    def from_icalendar(cls, ical_event, source_name: str) -> 'EventModel':
         """
         Create EventModel from an icalendar Event component.
         
         Args:
             ical_event: icalendar Event component
+            source_name: The name of the source this event belongs to.
             
         Returns:
             EventModel instance
@@ -179,7 +186,8 @@ class EventModel:
                 last_modified=last_modified,
                 sequence=sequence,
                 categories=categories,
-                classification=classification
+                classification=classification,
+                source_name=source_name
             )
             
         except Exception as e:
@@ -187,7 +195,8 @@ class EventModel:
             # Return minimal event to avoid complete failure
             return cls(
                 uid=str(ical_event.get('UID', 'unknown')),
-                summary=str(ical_event.get('SUMMARY', 'Untitled Event'))
+                summary=str(ical_event.get('SUMMARY', 'Untitled Event')),
+                source_name=source_name
             )
     
     def to_google_event(self) -> Dict[str, Any]:
@@ -255,7 +264,17 @@ class EventModel:
         elif self.classification == 'CONFIDENTIAL':
             google_event['visibility'] = 'confidential'
         else:
-            google_event['visibility'] = 'default'
+            google_event['visibility'] = 'public'
+
+        # Add extended properties for reconciliation
+        if self.source_name:
+            google_event['extendedProperties'] = {
+                'private': {
+                    'caldav-mirror-source': self.source_name,
+                    'caldav-mirror-uid': self.uid,
+                    'caldav-mirror-hash': self.compute_hash()
+                }
+            }
         
         return google_event
     
@@ -300,15 +319,13 @@ class EventModel:
             'end_date': self.end_date,
             'timezone': self.timezone,
             'location': self.location,
-            'organizer_email': self.organizer_email,
-            'status': self.status,
-            'transparency': self.transparency,
+
             'rrule': self.rrule,
             'recurrence_id': self.recurrence_id,
-            'attendees': sorted(self.attendees, key=lambda x: x['email']) if self.attendees else [],
             'sequence': self.sequence,
             'categories': sorted(self.categories) if self.categories else [],
-            'classification': self.classification
+            'classification': self.classification,
+            'source_name': self.source_name
         }
         
         # Convert to JSON string with sorted keys for consistent hashing
@@ -335,3 +352,50 @@ class EventModel:
             data['last_modified'] = datetime.fromisoformat(data['last_modified'])
         
         return cls(**data)
+
+    @classmethod
+    def from_google_event(cls, google_event: Dict[str, Any]) -> 'EventModel':
+        """
+        Create EventModel from a Google Calendar API event dictionary.
+        
+        Args:
+            google_event: Dictionary from Google Calendar API
+            
+        Returns:
+            EventModel instance
+        """
+        private_props = google_event.get('extendedProperties', {}).get('private', {})
+        
+        # Extract start and end times
+        start = google_event.get('start', {})
+        end = google_event.get('end', {})
+        
+        start_datetime = start.get('dateTime')
+        end_datetime = end.get('dateTime')
+        start_date = start.get('date')
+        end_date = end.get('date')
+        
+        if start_datetime:
+            start_datetime = datetime.fromisoformat(start_datetime)
+        if end_datetime:
+            end_datetime = datetime.fromisoformat(end_datetime)
+
+        return cls(
+            uid=private_props.get('caldav-mirror-uid'),
+            source_name=private_props.get('caldav-mirror-source'),
+            summary=google_event.get('summary'),
+            description=google_event.get('description'),
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            start_date=start_date,
+            end_date=end_date,
+            timezone=start.get('timeZone'),
+            location=google_event.get('location'),
+            status=google_event.get('status', 'CONFIRMED').upper(),
+            transparency=google_event.get('transparency', 'OPAQUE').upper(),
+            organizer_email=None,  # This is set by Google, so we ignore it for hashing
+            attendees=[], # Not included in hash
+            rrule=google_event.get('recurrence', [None])[0].replace('RRULE:', '') if google_event.get('recurrence') else None,
+            sequence=google_event.get('sequence', 0),
+            classification='PUBLIC' if google_event.get('visibility', 'public') == 'public' else google_event.get('visibility', 'PUBLIC').upper()
+        )

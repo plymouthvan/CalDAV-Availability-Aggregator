@@ -158,6 +158,57 @@ class Database:
                 })
             
             return events
+
+    async def get_all_events_for_source(self, source_name: str) -> Dict[str, Dict[str, Any]]:
+        """
+        Get all events for a specific source, keyed by CalDAV UID.
+
+        Args:
+            source_name: The name of the source.
+
+        Returns:
+            A dictionary mapping CalDAV UIDs to event data.
+        """
+        events = {}
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                SELECT caldav_uid, google_event_id, event_hash, event_data
+                FROM events
+                WHERE source_name = ?
+            """, (source_name,))
+            
+            async for row in cursor:
+                events[row[0]] = {
+                    'google_event_id': row[1],
+                    'event_hash': row[2],
+                    'event_data': json.loads(row[3])
+                }
+        return events
+
+    async def bulk_update_google_ids(self, source_name: str, uid_to_google_id_map: Dict[str, str]):
+        """
+        Bulk update the google_event_id for a set of events.
+
+        Args:
+            source_name: The name of the source.
+            uid_to_google_id_map: A dictionary mapping CalDAV UID to Google event ID.
+        """
+        if not uid_to_google_id_map:
+            return
+
+        update_tuples = [
+            (google_id, source_name, caldav_uid)
+            for caldav_uid, google_id in uid_to_google_id_map.items()
+        ]
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executemany("""
+                UPDATE events
+                SET google_event_id = ?
+                WHERE source_name = ? AND caldav_uid = ?
+            """, update_tuples)
+            await db.commit()
+            logger.info(f"Bulk updated {db.total_changes} Google event IDs for source {source_name}.")
     
     async def delete_event(self, source_name: str, caldav_uid: str) -> Optional[str]:
         """Delete an event and return its Google event ID if it exists."""
@@ -181,9 +232,16 @@ class Database:
             
             return google_event_id
     
-    async def update_sync_state(self, source_name: str, sync_method: str, 
-                               sync_token: Optional[str] = None, 
-                               ctag: Optional[str] = None, 
+    async def clear_all_events(self):
+        """Delete all events from the database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM events")
+            await db.commit()
+            logger.info("All events have been cleared from the database.")
+    
+    async def update_sync_state(self, source_name: str, sync_method: str,
+                                 sync_token: Optional[str] = None,
+                                 ctag: Optional[str] = None,
                                gtag: Optional[str] = None):
         """Update sync state for a source."""
         async with aiosqlite.connect(self.db_path) as db:

@@ -144,6 +144,15 @@ This tool will remove all data associated with a specific source, including all 
 docker compose -f docker/docker-compose.yml run --rm --entrypoint python3 caldav-mirror tools/source_cleanup.py "Your Source Name"
 ```
 
+### `clear_db.py`
+
+This tool will remove all event data from the local database. This is useful for forcing a complete re-sync from all sources, as it makes the application believe it has never seen any of the events before. It does **not** delete anything from Google Calendar and it preserves your authentication tokens and sync states.
+
+**Usage:**
+```bash
+docker compose -f docker/docker-compose.yml run --rm --entrypoint python3 caldav-mirror tools/clear_db.py
+```
+
 ## 💬 License
 
 MIT. Use it, fork it, build something weird with it.

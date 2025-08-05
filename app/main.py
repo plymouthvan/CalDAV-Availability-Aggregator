@@ -68,7 +68,7 @@ def load_configuration() -> Dict[str, Any]:
 
 async def main():
     """Main entry point for the CalDAV Mirror service."""
-    logger = setup_logger()
+    logger = setup_logger(level="DEBUG")
     logger.info("Starting CalDAV Mirror service...")
 
     try:
@@ -103,13 +103,17 @@ async def main():
         caldav_clients = []
         for source_config in config["sources"]:
             provider = source_config.pop("provider", "generic")
-            provider = source_config.pop("provider", "generic")
+            
+            # Special handling for iCloud
             if provider == "icloud":
                 source_config.pop("sync_method", None)
+
             client = CalDAVClient(provider, database=db, **source_config)
+            
             if not await client.test_connection():
-                 logger.error(f"Connection test failed for source: {source_config['name']}. Skipping.")
-                 continue
+                logger.error(f"Connection test failed for source: {source_config['name']}. Skipping.")
+                continue
+                
             caldav_clients.append(client)
             logger.info(f"Successfully connected to CalDAV source: {source_config['name']}")
 

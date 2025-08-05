@@ -19,8 +19,9 @@ logger = logging.getLogger(__name__)
 class iCloudCalDAVClient(BaseCalDAVClient):
     """iCloud-specific CalDAV client."""
 
-    def __init__(self, name: str, url: str, username: str, password: str, sync_method: str, database=None):
+    def __init__(self, name: str, url: str, username: str, password: str, database=None, **kwargs):
         super().__init__(name, url, username, password, database)
+        self.sync_method = 'calendar-query'
         self._auth = aiohttp.BasicAuth(username, password)
 
     async def sync_events(self) -> Tuple[List[EventModel], List[str], Optional[Dict[str, Any]]]:
@@ -48,18 +49,28 @@ class iCloudCalDAVClient(BaseCalDAVClient):
                         return [], [], None
                     
                     xml_content = await response.text()
-                    events, deleted_uids, sync_token = self._parse_calendar_query_response(xml_content)
+                    all_events, deleted_uids, sync_token = await self._parse_calendar_query_response(xml_content)
                     
                     # We don't get a sync token from this query, so we'll use ctag as the sync state
                     new_ctag = await self._get_ctag()
                     new_sync_state = {"ctag": new_ctag} if new_ctag else None
 
-                    return events, deleted_uids, new_sync_state
+                    # Filter out unchanged events
+                    new_and_updated_events = []
+                    if self.database:
+                        stored_events = await self.database.get_all_events_for_source(self.name)
+                        for event in all_events:
+                            if event.uid not in stored_events or event.compute_hash() != stored_events[event.uid]['event_hash']:
+                                new_and_updated_events.append(event)
+                    else:
+                        new_and_updated_events = all_events
+
+                    return new_and_updated_events, deleted_uids, new_sync_state
         except Exception as e:
             logger.error(f"iCloud sync error: {e}")
             return [], [], None
 
-    def _parse_calendar_query_response(self, xml_content: str) -> Tuple[List[EventModel], List[str], Optional[str]]:
+    async def _parse_calendar_query_response(self, xml_content: str) -> Tuple[List[EventModel], List[str], Optional[str]]:
         events = []
         try:
             root = ET.fromstring(xml_content)
@@ -71,14 +82,14 @@ class iCloudCalDAVClient(BaseCalDAVClient):
                         cal = Calendar.from_ical(calendar_data.text)
                         for component in cal.walk():
                             if component.name == "VEVENT":
-                                events.append(EventModel.from_icalendar(component))
+                                events.append(EventModel.from_icalendar(component, self.name))
                     except Exception as e:
                         logger.error(f"Failed to parse calendar data: {e}")
         except ET.ParseError as e:
             logger.error(f"Failed to parse calendar query response: {e}")
         
         # We don't get deleted UIDs from this query, so we have to find them by comparing
-        deleted_uids = asyncio.run(self._find_deleted_events(events))
+        deleted_uids = await self._find_deleted_events(events)
         return events, deleted_uids, None
 
     async def _get_ctag(self) -> Optional[str]:

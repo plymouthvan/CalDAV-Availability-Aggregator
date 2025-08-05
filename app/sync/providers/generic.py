@@ -126,7 +126,7 @@ class GenericCalDAVClient(BaseCalDAVClient):
                             cal = Calendar.from_ical(calendar_data.text)
                             for component in cal.walk():
                                 if component.name == "VEVENT":
-                                    events.append(EventModel.from_icalendar(component))
+                                    events.append(EventModel.from_icalendar(component, self.name))
                         except Exception as e:
                             logger.error(f"Failed to parse calendar data: {e}")
                     else:
@@ -154,7 +154,7 @@ class GenericCalDAVClient(BaseCalDAVClient):
                         cal = Calendar.from_ical(event_text)
                         for component in cal.walk():
                             if component.name == "VEVENT":
-                                return EventModel.from_icalendar(component)
+                                return EventModel.from_icalendar(component, self.name)
         except Exception as e:
             logger.error(f"Failed to fetch event data from {url}: {e}")
         return None
@@ -198,7 +198,7 @@ class GenericCalDAVClient(BaseCalDAVClient):
                         cal = Calendar.from_ical(calendar_data.text)
                         for component in cal.walk():
                             if component.name == "VEVENT":
-                                events.append(EventModel.from_icalendar(component))
+                                events.append(EventModel.from_icalendar(component, self.name))
                     except Exception as e:
                         logger.error(f"Failed to parse calendar data: {e}")
         except ET.ParseError as e:

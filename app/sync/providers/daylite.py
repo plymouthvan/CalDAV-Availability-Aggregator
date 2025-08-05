@@ -82,13 +82,13 @@ class DayliteCalDAVClient(BaseCalDAVClient):
                     resource_uid = self._extract_uid_from_href(href.text)
                     if resource_uid: deleted_uids.append(resource_uid)
                 elif '200' in status.text:
-                    calendar_data = response.find('.//A:calendar-data', namespaces)
+                    calendar_data = response.find('.//{*}calendar-data', namespaces)
                     if calendar_data is not None and calendar_data.text:
                         try:
                             cal = Calendar.from_ical(calendar_data.text)
                             for component in cal.walk():
                                 if component.name == "VEVENT":
-                                    events.append(EventModel.from_icalendar(component))
+                                    events.append(EventModel.from_icalendar(component, self.name))
                         except Exception as e:
                             logger.error(f"Failed to parse calendar data from {href.text}: {e}")
                     else:

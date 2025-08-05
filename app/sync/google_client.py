@@ -238,14 +238,159 @@ class GoogleClient:
         for part in parts:
             if '"id":' in part:
                 try:
-                    json_part = part[part.find('{'):part.rfind('}') + 1]
-                    data = json.loads(json_part)
-                    if 'id' in data and event_idx < len(original_events):
-                        caldav_uid = original_events[event_idx].uid
-                        results[caldav_uid] = data['id']
-                        event_idx += 1
+                    # A simple check to see if the part contains a success JSON response
+                    if '200 OK' in part and 'application/json' in part:
+                        json_part = part[part.find('{'):part.rfind('}') + 1]
+                        data = json.loads(json_part)
+                        if 'id' in data and event_idx < len(original_events):
+                            caldav_uid = original_events[event_idx].uid
+                            results[caldav_uid] = data['id']
+                    
+                    # Increment index regardless of success to keep alignment
+                    if 'Content-ID' in part:
+                         event_idx += 1
+
                 except json.JSONDecodeError:
+                    logger.warning("Failed to parse a part of the batch response.")
                     continue
         
         logger.info(f"Successfully processed {len(results)} events from batch response.")
         return results
+
+    async def list_mirrored_events(self, source_name: str) -> Dict[str, Dict[str, Any]]:
+        """
+        List all events in Google Calendar that are mirrored from a specific source.
+
+        Args:
+            source_name: The name of the CalDAV source.
+
+        Returns:
+            A dictionary mapping CalDAV UIDs to Google event data.
+        """
+        logger.info(f"Listing mirrored Google events for source: {source_name}")
+        events = {}
+        page_token = None
+        
+        url = f"{self.API_BASE_URL}/calendars/{self.calendar_id}/events"
+        headers = await self._get_auth_headers()
+        
+        params = {
+            'privateExtendedProperty': f"caldav-mirror-source={source_name}",
+            'maxResults': 2500, # Max allowed value
+            'fields': 'nextPageToken,items(id,extendedProperties,summary,updated)'
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                while True:
+                    if page_token:
+                        params['pageToken'] = page_token
+                    
+                    async with session.get(url, headers=headers, params=params) as response:
+                        if response.status != 200:
+                            error_text = await response.text()
+                            logger.error(f"Failed to list mirrored events: {response.status} - {error_text}")
+                            break
+                        
+                        data = await response.json()
+                        for item in data.get('items', []):
+                            private_props = item.get('extendedProperties', {}).get('private', {})
+                            uid = private_props.get('caldav-mirror-uid')
+                            if uid:
+                                events[uid] = item
+                        
+                        page_token = data.get('nextPageToken')
+                        if not page_token:
+                            break
+            
+            logger.info(f"Found {len(events)} mirrored events for source: {source_name}")
+            return events
+
+        except Exception as e:
+            logger.error(f"Error listing mirrored events: {e}", exc_info=True)
+            return {}
+
+    async def batch_update_events(self, events_to_update: List[Tuple[str, EventModel]]) -> bool:
+        """
+        Update multiple events in a single batch request.
+
+        Args:
+            events_to_update: A list of tuples, each containing (google_event_id, event_model).
+
+        Returns:
+            True if the batch operation was accepted, False otherwise.
+        """
+        if not events_to_update:
+            return True
+
+        logger.info(f"Batch updating {len(events_to_update)} Google events...")
+        batch_url = "https://www.googleapis.com/batch/calendar/v3"
+        headers = await self._get_auth_headers()
+        headers["Content-Type"] = "multipart/mixed; boundary=batch_boundary"
+
+        body = ""
+        for google_id, event in events_to_update:
+            event_data = event.to_google_event()
+            body += "--batch_boundary\n"
+            body += "Content-Type: application/http\n"
+            body += f"Content-ID: <item{uuid.uuid4()}>\n\n"
+            body += f"PUT /calendar/v3/calendars/{self.calendar_id}/events/{google_id}\n"
+            body += "Content-Type: application/json\n\n"
+            body += json.dumps(event_data) + "\n"
+        body += "--batch_boundary--"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(batch_url, data=body.encode('utf-8'), headers=headers) as response:
+                    if response.status == 200:
+                        logger.info("Batch update request successfully sent.")
+                        # Note: We are not parsing the response for individual errors here for simplicity.
+                        # A more robust implementation would check each part of the multipart response.
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Batch update failed: {response.status} - {error_text}")
+                        return False
+        except Exception as e:
+            logger.error(f"Error in batch update: {e}", exc_info=True)
+            return False
+
+    async def batch_delete_events(self, google_event_ids: List[str]) -> bool:
+        """
+        Delete multiple events in a single batch request.
+
+        Args:
+            google_event_ids: A list of Google event IDs to delete.
+
+        Returns:
+            True if the batch operation was accepted, False otherwise.
+        """
+        if not google_event_ids:
+            return True
+
+        logger.info(f"Batch deleting {len(google_event_ids)} Google events...")
+        batch_url = "https://www.googleapis.com/batch/calendar/v3"
+        headers = await self._get_auth_headers()
+        headers["Content-Type"] = "multipart/mixed; boundary=batch_boundary"
+
+        body = ""
+        for google_id in google_event_ids:
+            body += "--batch_boundary\n"
+            body += "Content-Type: application/http\n"
+            body += f"Content-ID: <item{uuid.uuid4()}>\n\n"
+            body += f"DELETE /calendar/v3/calendars/{self.calendar_id}/events/{google_id}\n\n"
+        body += "--batch_boundary--"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(batch_url, data=body.encode('utf-8'), headers=headers) as response:
+                    if response.status == 200:
+                        logger.info("Batch delete request successfully sent.")
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Batch delete failed: {response.status} - {error_text}")
+                        return False
+        except Exception as e:
+            logger.error(f"Error in batch delete: {e}", exc_info=True)
+            return False
