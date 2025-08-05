@@ -136,12 +136,12 @@ class CalDAVClient:
         logger.info(f"Discovered {len(calendars)} calendars for {self.name}")
         return calendars
     
-    async def sync_events(self) -> Tuple[List[EventModel], List[str]]:
+    async def sync_events(self) -> Tuple[List[EventModel], List[str], Optional[Dict[str, Any]]]:
         """
         Sync events using the configured sync method.
         
         Returns:
-            Tuple of (new/updated events, deleted event UIDs)
+            Tuple of (new/updated events, deleted event UIDs, new_sync_state)
         """
         logger.info(f"Syncing events for {self.name} using {self.sync_method}")
         
@@ -154,7 +154,7 @@ class CalDAVClient:
         else:
             raise ValueError(f"Unsupported sync method: {self.sync_method}")
     
-    async def _sync_with_sync_token(self) -> Tuple[List[EventModel], List[str]]:
+    async def _sync_with_sync_token(self) -> Tuple[List[EventModel], List[str], Optional[Dict[str, Any]]]:
         """Sync using WebDAV sync-token method (RFC 6578)."""
         # Get current sync state
         sync_state = await self.database.get_sync_state(self.name) if self.database else None
@@ -200,19 +200,17 @@ class CalDAVClient:
                     xml_content = await response.text()
                     events, deleted_uids, new_sync_token = self._parse_sync_collection_response(xml_content)
                     
-                    # Update sync state
-                    if new_sync_token and self.database:
-                        await self.database.update_sync_state(
-                            self.name, 'sync-token', sync_token=new_sync_token
-                        )
-                    
-                    return events, deleted_uids
+                    new_sync_state = None
+                    if new_sync_token:
+                        new_sync_state = {"sync_token": new_sync_token}
+
+                    return events, deleted_uids, new_sync_state
                 
         except Exception as e:
             logger.error(f"Sync-token sync error: {e}")
-            return [], []
+            return [], [], None
     
-    async def _sync_with_ctag(self) -> Tuple[List[EventModel], List[str]]:
+    async def _sync_with_ctag(self) -> Tuple[List[EventModel], List[str], Optional[Dict[str, Any]]]:
         """Sync using CalDAV ctag method."""
         # Get current sync state
         sync_state = await self.database.get_sync_state(self.name) if self.database else None
@@ -238,39 +236,35 @@ class CalDAVClient:
                 ) as response:
                     if response.status not in [200, 207]:
                         logger.error(f"CTag fetch failed: {response.status}")
-                        return [], []
+                        return [], [], None
                     
                     xml_content = await response.text()
                     new_ctag = self._parse_ctag_response(xml_content)
                     
                     if new_ctag == current_ctag:
                         logger.info(f"No changes detected for {self.name} (ctag unchanged)")
-                        return [], []
+                        return [], [], None
                     
                     # CTag changed, fetch all events
                     events = await self._fetch_all_events()
                     
-                    # Update sync state
-                    if self.database:
-                        await self.database.update_sync_state(
-                            self.name, 'ctag', ctag=new_ctag
-                        )
+                    new_sync_state = {"ctag": new_ctag}
                     
                     # For ctag, we need to compare with existing events to find deletions
                     deleted_uids = await self._find_deleted_events(events)
                     
-                    return events, deleted_uids
+                    return events, deleted_uids, new_sync_state
                 
         except Exception as e:
             logger.error(f"CTag sync error: {e}")
-            return [], []
+            return [], [], None
     
-    async def _sync_with_gtag(self) -> Tuple[List[EventModel], List[str]]:
+    async def _sync_with_gtag(self) -> Tuple[List[EventModel], List[str], Optional[Dict[str, Any]]]:
         """Sync using Google-style gtag method (if supported)."""
         # This is a placeholder for gtag implementation
         # Most CalDAV servers don't support gtag, but some Google-compatible ones might
         logger.warning(f"GTag sync not yet implemented for {self.name}")
-        return [], []
+        return [], [], None
     
     def _parse_sync_collection_response(self, xml_content: str) -> Tuple[List[EventModel], List[str], Optional[str]]:
         """Parse sync-collection REPORT response."""

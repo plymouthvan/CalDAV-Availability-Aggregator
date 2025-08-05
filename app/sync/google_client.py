@@ -8,7 +8,9 @@ updating, and deleting events in the destination calendar.
 import asyncio
 import aiohttp
 import logging
-from typing import Dict, Any, Optional, List
+import json
+from typing import Dict, Any, Optional, List, Tuple
+import uuid
 
 from .event_model import EventModel
 from auth.google_oauth import GoogleOAuth
@@ -169,3 +171,81 @@ class GoogleClient:
         except Exception as e:
             logger.error(f"Error getting Google event: {e}", exc_info=True)
             return None
+
+    async def batch_create_events(self, events: List[EventModel]) -> Dict[str, str]:
+        """
+        Create multiple events in a single batch request.
+
+        Args:
+            events: A list of normalized events to create.
+
+        Returns:
+            A dictionary mapping CalDAV UIDs to new Google event IDs.
+        """
+        if not events:
+            return {}
+
+        logger.info(f"Batch creating {len(events)} Google events...")
+        batch_url = f"{self.API_BASE_URL}/batch"
+        headers = await self._get_auth_headers()
+        headers["Content-Type"] = "multipart/mixed; boundary=batch_boundary"
+
+        # Construct the multipart request body
+        body = ""
+        for event in events:
+            event_data = event.to_google_event()
+            body += "--batch_boundary\n"
+            body += "Content-Type: application/http\n"
+            body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
+            body += f"POST /calendar/v3/calendars/{self.calendar_id}/events\n"
+            body += "Content-Type: application/json\n\n"
+            body += json.dumps(event_data) + "\n"
+        body += "--batch_boundary--"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(batch_url, data=body.encode('utf-8'), headers=headers) as response:
+                    if response.status == 200:
+                        # Process the multipart response
+                        return await self._parse_batch_response(response, events)
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Batch create failed: {response.status} - {error_text}")
+                        return {}
+        except Exception as e:
+            logger.error(f"Error in batch create: {e}", exc_info=True)
+            return {}
+
+    async def _parse_batch_response(self, response: aiohttp.ClientResponse, original_events: List[EventModel]) -> Dict[str, str]:
+        """Parse the multipart/mixed response from a batch request."""
+        # This is a simplified parser. A more robust solution would use a proper MIME parser.
+        content_type = response.headers.get('Content-Type', '')
+        boundary = None
+        for part in content_type.split(';'):
+            if 'boundary=' in part:
+                boundary = part.strip().split('=')[1]
+                break
+        
+        if not boundary:
+            logger.error("Batch response is missing boundary.")
+            return {}
+
+        body = await response.text()
+        parts = body.split(f'--{boundary}')
+        
+        results = {}
+        event_idx = 0
+        for part in parts:
+            if '"id":' in part:
+                try:
+                    json_part = part[part.find('{'):part.rfind('}') + 1]
+                    data = json.loads(json_part)
+                    if 'id' in data and event_idx < len(original_events):
+                        caldav_uid = original_events[event_idx].uid
+                        results[caldav_uid] = data['id']
+                        event_idx += 1
+                except json.JSONDecodeError:
+                    continue
+        
+        logger.info(f"Successfully processed {len(results)} events from batch response.")
+        return results

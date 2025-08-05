@@ -32,7 +32,7 @@ class SyncManager:
         logger.info(f"Starting sync for source: {self.source_name}")
         try:
             # 1. Fetch changes from CalDAV source
-            new_events, deleted_uids = await self.caldav.sync_events()
+            new_events, deleted_uids, new_sync_state = await self.caldav.sync_events()
             logger.info(f"Fetched {len(new_events)} new/updated events and {len(deleted_uids)} deletions.")
 
             # 2. Process deleted events
@@ -41,6 +41,16 @@ class SyncManager:
             # 3. Process new and updated events
             await self._process_updates(new_events)
 
+            # 4. Update sync state in the database *after* all operations are successful
+            if new_sync_state:
+                await self.db.update_sync_state(
+                    self.source_name,
+                    self.caldav.sync_method,
+                    sync_token=new_sync_state.get("sync_token"),
+                    ctag=new_sync_state.get("ctag")
+                )
+                logger.info(f"Successfully updated sync state for {self.source_name}.")
+
             logger.info(f"Sync finished for source: {self.source_name}")
 
         except Exception as e:
@@ -48,56 +58,53 @@ class SyncManager:
 
     async def _process_deletions(self, deleted_uids: List[str]):
         """Process events that were deleted from the CalDAV source."""
+        # This can be further optimized with batch deletes if the Google API supports it well.
+        # For now, we'll keep it simple.
         for uid in deleted_uids:
             logger.info(f"Processing deletion for CalDAV UID: {uid}")
-            # Get the Google event ID from our database before deleting the record
             google_event_id = await self.db.delete_event(self.source_name, uid)
-
             if google_event_id:
-                # Delete the event from Google Calendar
-                success = await self.google.delete_event(google_event_id)
-                if success:
-                    logger.info(f"Successfully deleted Google event for CalDAV UID: {uid}")
-                else:
-                    logger.error(f"Failed to delete Google event for CalDAV UID: {uid}")
-            else:
-                logger.warning(f"No corresponding Google event found for deleted CalDAV UID: {uid}")
+                await self.google.delete_event(google_event_id)
 
     async def _process_updates(self, events: List[EventModel]):
         """Process new and updated events from the CalDAV source."""
+        to_create = []
+        to_update = []
+
         for event in events:
-            event_hash = event.compute_hash()
-            
-            # Check if we have seen this event before
             stored_event = await self.db.get_event_by_caldav_uid(self.source_name, event.uid)
-
             if stored_event:
-                # Event exists, check if it has changed
-                if stored_event["event_hash"] != event_hash:
-                    logger.info(f"Event changed, updating: {event.summary} ({event.uid})")
-                    # Update Google Calendar event
-                    if stored_event["google_event_id"]:
-                        await self.google.update_event(stored_event["google_event_id"], event)
-                    else:
-                        logger.warning(f"No Google event ID for updated event {event.uid}, creating new one.")
-                        new_google_id = await self.google.create_event(event)
-                        stored_event["google_event_id"] = new_google_id
-
-                    # Update database
-                    await self.db.store_event(
-                        self.source_name, event.uid, event.to_dict(), event_hash, stored_event["google_event_id"]
-                    )
-                else:
-                    logger.debug(f"Event unchanged, skipping: {event.summary} ({event.uid})")
+                if stored_event["event_hash"] != event.compute_hash():
+                    to_update.append((stored_event["google_event_id"], event))
             else:
-                # New event, create it in Google Calendar
-                logger.info(f"New event found, creating: {event.summary} ({event.uid})")
-                google_event_id = await self.google.create_event(event)
+                to_create.append(event)
 
-                if google_event_id:
-                    # Store the new event in our database
+        # Batch create new events
+        if to_create:
+            created_map = await self.google.batch_create_events(to_create)
+            for event in to_create:
+                if event.uid in created_map:
+                    google_event_id = created_map[event.uid]
                     await self.db.store_event(
-                        self.source_name, event.uid, event.to_dict(), event_hash, google_event_id
+                        self.source_name, event.uid, event.to_dict(), event.compute_hash(), google_event_id
                     )
                 else:
                     logger.error(f"Failed to create Google event for new CalDAV event: {event.uid}")
+
+        # Update existing events (can also be batched)
+        if to_update:
+            for google_event_id, event in to_update:
+                logger.info(f"Event changed, updating: {event.summary} ({event.uid})")
+                if google_event_id:
+                    await self.google.update_event(google_event_id, event)
+                    await self.db.store_event(
+                        self.source_name, event.uid, event.to_dict(), event.compute_hash(), google_event_id
+                    )
+                else:
+                    # This case should be rare, but we handle it by creating a new event.
+                    logger.warning(f"No Google event ID for updated event {event.uid}, creating new one.")
+                    new_google_id = await self.google.create_event(event)
+                    if new_google_id:
+                        await self.db.store_event(
+                            self.source_name, event.uid, event.to_dict(), event.compute_hash(), new_google_id
+                        )

@@ -91,7 +91,7 @@ class Database:
                 SET event_hash = ?, event_data = ?, google_event_id = ?, 
                     updated_at = CURRENT_TIMESTAMP, last_synced = CURRENT_TIMESTAMP
                 WHERE source_name = ? AND caldav_uid = ?
-            """, (event_hash, json.dumps(event_data), google_event_id, source_name, caldav_uid))
+            """, (event_hash, json.dumps(event_data, default=str), google_event_id, source_name, caldav_uid))
             
             if db.total_changes == 0:
                 # Insert new event
@@ -100,7 +100,7 @@ class Database:
                                       event_data, google_event_id, last_synced)
                     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """, (internal_id, source_name, caldav_uid, event_hash, 
-                      json.dumps(event_data), google_event_id))
+                      json.dumps(event_data, default=str), google_event_id))
             else:
                 # Get the existing internal_id
                 cursor = await db.execute("""

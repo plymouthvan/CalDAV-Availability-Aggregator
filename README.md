@@ -49,6 +49,13 @@ CalDAV Mirror is a headless background service that aggregates events from one o
     # ID of the Google Calendar to sync to. Defaults to "primary".
     # Find this in your Google Calendar settings.
     GOOGLE_CALENDAR_ID=primary
+
+    # Path to the database file inside the container.
+    # It's recommended to leave this as the default.
+    DATABASE_PATH=/app/data/caldav_mirror.db
+
+    # Optional: How often to sync, in seconds. Defaults to 300 (5 minutes).
+    SYNC_INTERVAL_SECONDS=300
     ```
 
 4. Configure `sources.yml`. See below.

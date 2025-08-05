@@ -122,7 +122,7 @@ class EventModel:
             transparency = str(ical_event.get('TRANSP', 'OPAQUE')).upper()
             
             # Recurrence
-            rrule = str(ical_event.get('RRULE', '')) if ical_event.get('RRULE') else None
+            rrule = ical_event.get('RRULE').to_ical().decode('utf-8') if ical_event.get('RRULE') else None
             recurrence_id = str(ical_event.get('RECURRENCE-ID', '')) if ical_event.get('RECURRENCE-ID') else None
             
             # Attendees

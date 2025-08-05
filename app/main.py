@@ -37,7 +37,9 @@ def load_configuration() -> Dict[str, Any]:
         "google_client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
         "encryption_key": os.getenv("ENCRYPTION_KEY"),
         "google_calendar_id": os.getenv("GOOGLE_CALENDAR_ID", "primary"),
-        "sources": []
+        "sources": [],
+        "database_path": os.getenv("DATABASE_PATH", "/app/data/caldav_mirror.db"),
+        "sync_interval_seconds": int(os.getenv("SYNC_INTERVAL_SECONDS", 300))
     }
 
     # Validate required environment variables
@@ -77,7 +79,7 @@ async def main():
         logger.info(f"Loaded {len(config['sources'])} CalDAV source(s).")
 
         # 2. Initialize Database
-        db = Database()
+        db = Database(db_path=config["database_path"])
         await db.initialize()
 
         # 3. Initialize Google OAuth and Client
@@ -131,7 +133,7 @@ async def main():
                 await manager.run_sync()
             
             logger.info("Sync cycle finished. Waiting for next run...")
-            await asyncio.sleep(300)  # Sync every 5 minutes
+            await asyncio.sleep(config["sync_interval_seconds"])
 
     except (ValueError, FileNotFoundError) as e:
         logger.error(f"Configuration error: {e}")
