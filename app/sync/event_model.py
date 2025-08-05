@@ -322,7 +322,6 @@ class EventModel:
 
             'rrule': self.rrule,
             'recurrence_id': self.recurrence_id,
-            'sequence': self.sequence,
             'categories': sorted(self.categories) if self.categories else [],
             'classification': self.classification,
             'source_name': self.source_name
@@ -375,11 +374,19 @@ class EventModel:
         start_date = start.get('date')
         end_date = end.get('date')
         
-        if start_datetime:
-            start_datetime = datetime.fromisoformat(start_datetime)
-        if end_datetime:
-            end_datetime = datetime.fromisoformat(end_datetime)
+        if start_datetime and isinstance(start_datetime, str):
+            start_datetime = datetime.fromisoformat(start_datetime.replace('Z', '+00:00'))
+        if end_datetime and isinstance(end_datetime, str):
+            end_datetime = datetime.fromisoformat(end_datetime.replace('Z', '+00:00'))
 
+        # Extract recurrence rule
+        rrule = None
+        if 'recurrence' in google_event:
+            for rule in google_event['recurrence']:
+                if rule.startswith('RRULE:'):
+                    rrule = rule.replace('RRULE:', '')
+                    break
+        
         return cls(
             uid=private_props.get('caldav-mirror-uid'),
             source_name=private_props.get('caldav-mirror-source'),
@@ -393,9 +400,9 @@ class EventModel:
             location=google_event.get('location'),
             status=google_event.get('status', 'CONFIRMED').upper(),
             transparency=google_event.get('transparency', 'OPAQUE').upper(),
-            organizer_email=None,  # This is set by Google, so we ignore it for hashing
-            attendees=[], # Not included in hash
-            rrule=google_event.get('recurrence', [None])[0].replace('RRULE:', '') if google_event.get('recurrence') else None,
+            organizer_email=None,
+            attendees=[],
+            rrule=rrule,
             sequence=google_event.get('sequence', 0),
             classification='PUBLIC' if google_event.get('visibility', 'public') == 'public' else google_event.get('visibility', 'PUBLIC').upper()
         )

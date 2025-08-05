@@ -105,10 +105,14 @@ class Reconciler:
             logger.debug(f"  Google Hash: {google_event_hash}")
 
             if db_event_data['event_hash'] != google_event_hash:
-                logger.info(f"Hash mismatch for UID {uid}. Event will be updated.")
-                event_model = EventModel.from_dict(db_event_data['event_data'])
-                to_update.append((google_event_id, event_model))
-                logger.info(f"Trigger Nine (Loop)")
+                logger.debug(f"Hash mismatch for UID {uid}. Event will be updated.")
+                event_model_from_db = EventModel.from_dict(db_event_data['event_data'])
+                
+                logger.debug(f"Event data from DB for UID {uid}: {event_model_from_db.to_dict()}")
+                logger.debug(f"Event data from Google for UID {uid}: {google_event_model.to_dict()}")
+                
+                to_update.append((google_event_id, event_model_from_db))
+                logger.debug(f"Trigger Nine (Loop)")
 
         logger.info(f"Reconciliation plan: {len(to_create)} to create, {len(to_update)} to update, {len(to_delete)} to delete.")
 

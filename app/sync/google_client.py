@@ -277,7 +277,7 @@ class GoogleClient:
         params = {
             'privateExtendedProperty': f"caldav-mirror-source={source_name}",
             'maxResults': 2500, # Max allowed value
-            'fields': 'nextPageToken,items(id,extendedProperties,summary,updated)'
+            'fields': 'nextPageToken,items(id,summary,description,location,start,end,status,transparency,recurrence,sequence,visibility,extendedProperties)'
         }
 
         try:
