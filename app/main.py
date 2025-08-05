@@ -59,10 +59,8 @@ def load_configuration() -> Dict[str, Any]:
 
     # Validate sources configuration
     for source in config["sources"]:
-        if not all(k in source for k in ["name", "url", "username", "password", "sync_method"]):
+        if not all(k in source for k in ["name", "url", "username", "password"]):
             raise ValueError(f"Source '{source.get('name', 'Unknown')}' is missing required keys.")
-        if source["sync_method"] not in ["sync-token", "ctag", "gtag"]:
-            raise ValueError(f"Invalid sync_method for source '{source['name']}'.")
 
     return config
 
@@ -104,7 +102,11 @@ async def main():
         # 4. Initialize CalDAV Clients
         caldav_clients = []
         for source_config in config["sources"]:
-            client = CalDAVClient(database=db, **source_config)
+            provider = source_config.pop("provider", "generic")
+            provider = source_config.pop("provider", "generic")
+            if provider == "icloud":
+                source_config.pop("sync_method", None)
+            client = CalDAVClient(provider, database=db, **source_config)
             if not await client.test_connection():
                  logger.error(f"Connection test failed for source: {source_config['name']}. Skipping.")
                  continue

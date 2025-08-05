@@ -82,7 +82,8 @@ You must explicitly declare each CalDAV source and how it should be synced. Auto
   url: "https://cal.example.com/user/calendars/work/"
   username: "your-username"
   password: "your-password"
-  sync_method: "sync-token"   # or "ctag" or "gtag"
+  provider: "generic"  # or "icloud"
+  sync_method: "sync-token"   # or "ctag"
 ```
 
 Startup will fail if this file is missing or malformed.
