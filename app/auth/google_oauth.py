@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from urllib.parse import urlencode
 import os
+from utils.encryption import Encryption
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,11 @@ class GoogleOAuth:
         "https://www.googleapis.com/auth/calendar.events"
     ]
     
-    def __init__(self, client_id: str, client_secret: str, database=None):
+    def __init__(self, client_id: str, client_secret: str, encryption_key: str, database=None):
         self.client_id = client_id
         self.client_secret = client_secret
         self.database = database
+        self.encryption = Encryption(encryption_key)
         self._access_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
         self._token_expires_at: Optional[datetime] = None
@@ -211,8 +213,9 @@ class GoogleOAuth:
                 'expires_at': self._token_expires_at.isoformat()
             }
             
-            # TODO: Encrypt token data before storing
-            encrypted_token = json.dumps(token_data)  # Placeholder - should be encrypted
+            # Encrypt token data before storing
+            token_json = json.dumps(token_data)
+            encrypted_token = self.encryption.encrypt(token_json)
             
             await self.database.store_auth_token(
                 'google_calendar',
@@ -228,8 +231,9 @@ class GoogleOAuth:
         try:
             encrypted_token = await self.database.get_auth_token('google_calendar')
             if encrypted_token:
-                # TODO: Decrypt token data
-                token_data = json.loads(encrypted_token)  # Placeholder - should be decrypted
+                # Decrypt token data
+                decrypted_token = self.encryption.decrypt(encrypted_token)
+                token_data = json.loads(decrypted_token)
                 
                 self._access_token = token_data.get('access_token')
                 self._refresh_token = token_data.get('refresh_token')

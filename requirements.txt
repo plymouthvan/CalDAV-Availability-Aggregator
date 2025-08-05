@@ -3,6 +3,8 @@ aiohttp
 aiosqlite
 icalendar
 pyyaml
+python-dotenv
 
 # For building dependencies
 lxml
+cryptography

@@ -37,10 +37,14 @@ CalDAV Mirror is a headless background service that aggregates events from one o
     ```
 
 3. Configure `.env`:
-    ```
+    ```dotenv
+    # Get these from the Google Cloud Console
     GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
     GOOGLE_CLIENT_SECRET=your-client-secret
-    GOOGLE_REDIRECT_URI=urn:ietf:wg:oauth:2.0:oob
+
+    # A 32-byte random string for encrypting tokens.
+    # Generate one with: openssl rand -hex 32
+    ENCRYPTION_KEY=your-super-secret-32-byte-encryption-key
     ```
 
 4. Configure `sources.yml`. See below.
@@ -99,7 +103,21 @@ SQLite is used for persistence. All synced events are stored with:
 
 ## 🧪 Validating a CalDAV Source
 
-Run the provided `capabilities.py` (or similar script) to determine what sync methods are supported for your CalDAV server. Add the result manually to `sources.yml`.
+Before configuring `sources.yml`, you need to know which sync method your CalDAV server supports. This repository includes a `capabilities.py` script to help you find out.
+
+1.  **Install dependencies locally:**
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+2.  **Run the script:**
+    ```bash
+    python capabilities.py https://your-caldav-server.com/path/to/calendar/ \
+      --username "your-username" \
+      --password "your-password"
+    ```
+
+The script will output the recommended `sync_method` to use for that source in your `sources.yml` file. The most efficient method is `sync-token`, followed by `ctag`.
 
 ## 💬 License
 
