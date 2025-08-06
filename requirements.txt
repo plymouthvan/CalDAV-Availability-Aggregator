@@ -8,3 +8,4 @@ python-dotenv
 # For building dependencies
 lxml
 cryptography
+python-dateutil

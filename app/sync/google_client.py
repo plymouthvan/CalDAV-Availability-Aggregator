@@ -107,42 +107,82 @@ class GoogleClient:
             logger.error(f"Error deleting Google event: {e}", exc_info=True)
             return False
 
-    async def list_mirrored_master_events(self, source_name: str) -> Dict[str, Dict[str, Any]]:
-        """Fetches only the master events from Google Calendar."""
-        logger.info(f"Listing mirrored master events for source: {source_name}")
-        events = {}
+    async def _list_events_paginated(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Helper to fetch events with pagination."""
+        all_items = []
         page_token = None
         url = f"{self.API_BASE_URL}/calendars/{self.calendar_id}/events"
         headers = await self._get_auth_headers()
-        params = {
-            'privateExtendedProperty': f"caldav-mirror-source={source_name}",
-            'maxResults': 2500
-        }
 
         try:
             async with aiohttp.ClientSession() as session:
                 while True:
                     if page_token:
                         params['pageToken'] = page_token
-                    async with session.get(url, headers=headers, params=params) as response:
+                    
+                    # Filter out None values from params before the request
+                    request_params = {k: v for k, v in params.items() if v is not None}
+                    
+                    logger.debug(f"Requesting events with params: {request_params}")
+                    async with session.get(url, headers=headers, params=request_params) as response:
                         if response.status != 200:
-                            logger.error(f"Failed to list master events: {response.status} - {await response.text()}")
+                            error_text = await response.text()
+                            logger.error(f"Failed to list events: {response.status} - {error_text}")
                             break
                         data = await response.json()
-                        for item in data.get('items', []):
-                            if item.get('status') == 'cancelled':
-                                continue
-                            private_props = item.get('extendedProperties', {}).get('private', {})
-                            uid = private_props.get('caldav-mirror-uid')
-                            if uid:
-                                events[uid] = item
+                        items = data.get('items', [])
+                        active_items = [item for item in items if item.get('status') != 'cancelled']
+                        
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"Received page with {len(items)} items, {len(active_items)} active.")
+
+                        all_items.extend(active_items)
                         page_token = data.get('nextPageToken')
                         if not page_token:
                             break
         except Exception as e:
-            logger.error(f"Error fetching master events: {e}", exc_info=True)
+            logger.error(f"Error fetching events: {e}", exc_info=True)
+        
+        return all_items
+
+    async def list_mirrored_master_events(self, source_name: str) -> Dict[str, Dict[str, Any]]:
+        """Fetches only the master events from Google Calendar."""
+        logger.info(f"Listing mirrored master events for source: {source_name}")
+        params = {
+            'privateExtendedProperty': f"caldav-mirror-source={source_name}",
+            'maxResults': 2500
+        }
+        items = await self._list_events_paginated(params)
+        
+        events = {}
+        for item in items:
+            private_props = item.get('extendedProperties', {}).get('private', {})
+            uid = private_props.get('caldav-mirror-uid')
+            if uid:
+                events[uid] = item
         
         logger.info(f"Found {len(events)} mirrored master events for source: {source_name}")
+        return events
+
+    async def list_all_mirrored_events(self, source_name: str) -> Dict[Tuple[str, Optional[str]], Dict[str, Any]]:
+        """Fetches all mirrored events (masters and instances) from Google Calendar."""
+        logger.info(f"Listing all mirrored events for source: {source_name}")
+        params = {
+            'privateExtendedProperty': f"caldav-mirror-source={source_name}",
+            'maxResults': 2500
+        }
+        items = await self._list_events_paginated(params)
+
+        events = {}
+        for item in items:
+            private_props = item.get('extendedProperties', {}).get('private', {})
+            uid = private_props.get('caldav-mirror-uid')
+            if uid:
+                model = EventModel.from_google_event(item)
+                key = (uid, model.recurrence_id)
+                events[key] = item
+        
+        logger.info(f"Found {len(events)} mirrored events for source: {source_name}")
         return events
 
     async def get_event_instances(self, google_event_id: str) -> List[Dict[str, Any]]:
@@ -152,7 +192,7 @@ class GoogleClient:
         page_token = None
         url = f"{self.API_BASE_URL}/calendars/{self.calendar_id}/events/{google_event_id}/instances"
         headers = await self._get_auth_headers()
-        params = {'maxResults': 2500, 'showDeleted': 'true'}
+        params = {'maxResults': 2500}
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -161,10 +201,17 @@ class GoogleClient:
                         params['pageToken'] = page_token
                     async with session.get(url, headers=headers, params=params) as response:
                         if response.status != 200:
-                            logger.error(f"Failed to get event instances: {response.status} - {await response.text()}")
+                            error_text = await response.text()
+                            logger.error(f"Failed to get event instances for {google_event_id}: {response.status} - {error_text}")
                             break
                         data = await response.json()
-                        instances.extend(data.get('items', []))
+                        items = data.get('items', [])
+                        active_items = [item for item in items if item.get('status') != 'cancelled']
+                        
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"Received page with {len(items)} items, {len(active_items)} active.")
+                        
+                        instances.extend(active_items)
                         page_token = data.get('nextPageToken')
                         if not page_token:
                             break
