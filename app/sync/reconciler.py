@@ -7,7 +7,9 @@ the database.
 """
 
 import logging
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
+from datetime import datetime, timedelta, timezone
+from icalendar import vRecur
 
 from .google_client import GoogleClient
 from database import Database
@@ -18,123 +20,136 @@ logger = logging.getLogger(__name__)
 class Reconciler:
     """
     Orchestrates the reconciliation between the local database and Google
-    Calendar for a specific source.
+    Calendar for a specific source, with full support for recurring events.
     """
 
     def __init__(self, google_client: GoogleClient, database: Database):
-        """
-        Initializes the Reconciler.
-
-        Args:
-            google_client: An instance of the GoogleClient.
-            database: An instance of the Database.
-        """
         self.google = google_client
         self.db = database
 
     async def reconcile_source(self, source_name: str):
         """
-        Performs a full reconciliation for a given source.
-
-        This method will:
-        1. Fetch all events for the source from the local database (desired state).
-        2. Fetch all corresponding events from Google Calendar (actual state).
-        3. Compare the two states to determine what needs to be created,
-           updated, or deleted on Google Calendar.
-        4. Execute the necessary batch operations.
-
-        Args:
-            source_name: The name of the source to reconcile.
+        Performs a full, recurrence-aware reconciliation for a given source.
         """
         logger.info(f"Starting reconciliation for source: {source_name}")
 
-        # 1. Get the desired state from our local database
-        db_events = await self.db.get_all_events_for_source(source_name)
-        logger.info(f"Found {len(db_events)} events in the database for {source_name}.")
-        logger.info(f"Trigger One")
+        db_instances = await self.db.get_all_events_for_source(source_name)
+        google_master_events_raw = await self.google.list_mirrored_master_events(source_name)
+        
+        google_instances = {}
+        for uid, g_master_event in google_master_events_raw.items():
+            master_model = EventModel.from_google_event(g_master_event)
+            google_instances[(uid, None)] = master_model
 
-        # 2. Get the actual state from Google Calendar
-        google_events = await self.google.list_mirrored_events(source_name)
-        logger.info(f"Found {len(google_events)} mirrored events on Google Calendar for {source_name}.")
-        logger.info(f"Trigger Two")
+            if g_master_event.get('recurrence'):
+                instances_raw = await self.google.get_event_instances(g_master_event['id'])
+                for g_instance in instances_raw:
+                    if g_instance.get('status') == 'cancelled':
+                        continue
+                    
+                    instance_model = EventModel.from_google_event(g_instance)
+                    if instance_model.recurrence_id:
+                        key = (uid, instance_model.recurrence_id)
+                        google_instances[key] = instance_model
 
-        # 3. Compare the two states to find differences
+        # Expand recurring events from the database into a full instance list
+        desired_instances = self._expand_db_events(db_instances)
+
+        db_keys = set(desired_instances.keys())
+        google_keys = set(google_instances.keys())
+
         to_create: List[EventModel] = []
         to_update: List[Tuple[str, EventModel]] = []
         to_delete: List[str] = []
-        logger.info(f"Trigger Three")
 
-        db_uids = set(db_events.keys())
-        google_uids = set(google_events.keys())
-        logger.info(f"Trigger Four")
+        # Events to create
+        for key in db_keys - google_keys:
+            model = desired_instances[key]
+            if model.recurrence_id:
+                master_key = (model.uid, None)
+                master_gcal_event = google_instances.get(master_key)
+                if master_gcal_event and master_gcal_event.google_event_id:
+                    model.google_recurring_event_id = master_gcal_event.google_event_id
+                else:
+                    logger.warning(f"Cannot create exception {key} because its master is not in Google yet.")
+                    continue
+            to_create.append(model)
 
-        # Events to create are in DB but not in Google
-        for uid in db_uids - google_uids:
-            event_data = db_events[uid]['event_data']
-            to_create.append(EventModel.from_dict(event_data))
-            logger.info(f"Trigger Five (Loop)")
+        # Events to delete
+        for key in google_keys - db_keys:
+            google_model = google_instances[key]
+            if google_model.google_event_id:
+                to_delete.append(google_model.google_event_id)
 
-        # Events to delete are in Google but not in DB
-        for uid in google_uids - db_uids:
-            to_delete.append(google_events[uid]['id'])
-            logger.info(f"Trigger Six (Loop)")
-
-        # Events that exist in both need to be checked for updates
-        for uid in db_uids.intersection(google_uids):
-            db_event_data = db_events[uid]
-            google_event_id = db_event_data.get('google_event_id')
-            logger.info(f"Trigger Seven ")
+        # Events to update
+        for key in db_keys.intersection(google_keys):
+            db_model = desired_instances[key]
+            google_model = google_instances[key]
             
-            if not google_event_id:
-                # This should not happen, but as a safeguard...
-                logger.warning(f"DB event {uid} is missing a Google ID. Re-creating.")
-                to_create.append(EventModel.from_dict(db_event_data['event_data']))
-                continue
+            if db_model.compute_hash() != google_model.compute_hash():
+                db_model.google_event_id = google_model.google_event_id
+                if db_model.recurrence_id:
+                    master_key = (db_model.uid, None)
+                    master_gcal_event = google_instances.get(master_key)
+                    if master_gcal_event:
+                        db_model.google_recurring_event_id = master_gcal_event.google_event_id
+                to_update.append((db_model.google_event_id, db_model))
 
-            # Compare hashes to detect changes
-            google_event = google_events[uid]
-            google_hash = google_event.get('extendedProperties', {}).get('private', {}).get('caldav-mirror-hash')
-            logger.info(f"Trigger Eight ")
+        logger.info(f"Reconciliation plan: {len(to_create)} create, {len(to_update)} update, {len(to_delete)} delete.")
 
-            # Create an EventModel from the Google Calendar data to compute its hash
-            google_event_model = EventModel.from_google_event(google_event)
-            google_event_hash = google_event_model.compute_hash()
-
-            logger.debug(f"Comparing hashes for UID {uid}:")
-            logger.debug(f"  DB Hash:     {db_event_data['event_hash']}")
-            logger.debug(f"  Google Hash: {google_event_hash}")
-
-            if db_event_data['event_hash'] != google_event_hash:
-                logger.debug(f"Hash mismatch for UID {uid}. Event will be updated.")
-                event_model_from_db = EventModel.from_dict(db_event_data['event_data'])
-                
-                logger.debug(f"Event data from DB for UID {uid}: {event_model_from_db.to_dict()}")
-                logger.debug(f"Event data from Google for UID {uid}: {google_event_model.to_dict()}")
-                
-                to_update.append((google_event_id, event_model_from_db))
-                logger.debug(f"Trigger Nine (Loop)")
-
-        logger.info(f"Reconciliation plan: {len(to_create)} to create, {len(to_update)} to update, {len(to_delete)} to delete.")
-
-        # 4. Execute the batch operations
         if to_create:
             created_map = await self.google.batch_create_events(to_create)
             if created_map:
                 await self.db.bulk_update_google_ids(source_name, created_map)
-                logger.info(f"Successfully created {len(created_map)} new events.")
-            else:
-                logger.error("Failed to create new events during reconciliation.")
-
-        if to_update:
-            if await self.google.batch_update_events(to_update):
-                logger.info(f"Successfully updated {len(to_update)} events.")
-            else:
-                logger.error("Failed to update events during reconciliation.")
-
-        if to_delete:
-            if await self.google.batch_delete_events(to_delete):
-                logger.info(f"Successfully deleted {len(to_delete)} events.")
-            else:
-                logger.error("Failed to delete events during reconciliation.")
         
+        if to_update:
+            await self.google.batch_update_events(to_update)
+        
+        if to_delete:
+            await self.google.batch_delete_events(to_delete)
+
         logger.info(f"Reconciliation finished for source: {source_name}")
+
+    def _expand_db_events(self, db_events: Dict[Tuple[str, Optional[str]], Dict[str, Any]]) -> Dict[Tuple[str, Optional[str]], EventModel]:
+        """
+        Expands recurring events from the database into a full instance list.
+        """
+        expanded_events = {}
+        db_master_events = {k[0]: EventModel.from_dict(v['event_data']) for k, v in db_events.items() if v['event_data'].get('is_master_event')}
+        db_exceptions = {k: EventModel.from_dict(v['event_data']) for k, v in db_events.items() if not v['event_data'].get('is_master_event')}
+
+        for uid, master_event in db_master_events.items():
+            if not master_event.rrule:
+                expanded_events[(uid, None)] = master_event
+                continue
+
+            try:
+                rule = vRecur.from_string(f"RRULE:{master_event.rrule}")
+                start_dt = master_event.start_datetime
+                duration = master_event.end_datetime - start_dt
+                
+                now = datetime.now(start_dt.tzinfo)
+                after = now - timedelta(days=1) # Include today
+                before = now + timedelta(days=730) # 2 years into the future
+                
+                for instance_start in rule.iterset(dtstart=start_dt, after=after, before=before):
+                    rid = instance_start.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+                    key = (uid, rid)
+                    
+                    if key not in db_exceptions:
+                        instance_model = EventModel.from_dict(master_event.to_dict())
+                        instance_model.start_datetime = instance_start
+                        instance_model.end_datetime = instance_start + duration
+                        instance_model.recurrence_id = rid
+                        instance_model.is_master_event = False
+                        instance_model.rrule = None
+                        expanded_events[key] = instance_model
+
+            except Exception as e:
+                logger.error(f"Failed to expand RRULE for event {uid}: {e}")
+
+        # Add exceptions to the final list, overriding any expanded instances
+        for key, ex_model in db_exceptions.items():
+            expanded_events[key] = ex_model
+            
+        return expanded_events

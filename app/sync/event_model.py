@@ -42,7 +42,10 @@ class EventModel:
     # Recurrence
     rrule: Optional[str] = None
     recurrence_id: Optional[str] = None
-    
+    is_master_event: bool = False
+    google_recurring_event_id: Optional[str] = None # For exceptions, the master event's Google ID
+    google_event_id: Optional[str] = None # The event's own Google ID
+
     # Attendees
     attendees: List[Dict[str, str]] = None
     
@@ -80,6 +83,13 @@ class EventModel:
         Returns:
             EventModel instance
         """
+        logger.debug(f"--- Parsing iCalendar Event from {source_name} ---")
+        logger.debug(f"iCal Raw UID: {ical_event.get('UID')}")
+        logger.debug(f"iCal Raw SUMMARY: {ical_event.get('SUMMARY')}")
+        logger.debug(f"iCal Raw DTSTART: {ical_event.get('DTSTART').dt if ical_event.get('DTSTART') else 'N/A'}")
+        logger.debug(f"iCal Raw RRULE: {ical_event.get('RRULE')}")
+        logger.debug(f"iCal Raw RECURRENCE-ID: {ical_event.get('RECURRENCE-ID')}")
+        
         try:
             # Extract basic properties
             uid = str(ical_event.get('UID', ''))
@@ -130,8 +140,21 @@ class EventModel:
             
             # Recurrence
             rrule = ical_event.get('RRULE').to_ical().decode('utf-8') if ical_event.get('RRULE') else None
-            recurrence_id = str(ical_event.get('RECURRENCE-ID', '')) if ical_event.get('RECURRENCE-ID') else None
             
+            recurrence_id_val = ical_event.get('RECURRENCE-ID')
+            recurrence_id = None
+            if recurrence_id_val:
+                dt = recurrence_id_val.dt
+                if isinstance(dt, datetime):
+                    if dt.tzinfo:
+                        recurrence_id = dt.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+                    else:
+                        recurrence_id = dt.strftime('%Y%m%dT%H%M%S') # Naive, assume UTC
+                else: # date object
+                    recurrence_id = dt.strftime('%Y%m%d')
+
+            is_master_event = rrule is not None
+
             # Attendees
             attendees = []
             for attendee in ical_event.get('ATTENDEE', []):
@@ -181,6 +204,7 @@ class EventModel:
                 transparency=transparency,
                 rrule=rrule,
                 recurrence_id=recurrence_id,
+                is_master_event=is_master_event,
                 attendees=attendees,
                 created=created,
                 last_modified=last_modified,
@@ -244,9 +268,13 @@ class EventModel:
             }
         
         # Recurrence
-        if self.rrule:
+        if self.google_recurring_event_id:
+            # This is an exception, link it to the master event in Google
+            google_event['recurringEventId'] = self.google_recurring_event_id
+        elif self.rrule:
+            # This is a master event with a recurrence rule
             google_event['recurrence'] = [f'RRULE:{self.rrule}']
-        
+
         # Attendees
         if self.attendees:
             google_event['attendees'] = [
@@ -322,6 +350,8 @@ class EventModel:
 
             'rrule': self.rrule,
             'recurrence_id': self.recurrence_id,
+            'is_master_event': self.is_master_event,
+            'google_recurring_event_id': self.google_recurring_event_id,
             'categories': sorted(self.categories) if self.categories else [],
             'classification': self.classification,
             'source_name': self.source_name
@@ -363,6 +393,14 @@ class EventModel:
         Returns:
             EventModel instance
         """
+        logger.debug("--- Parsing Google Calendar Event ---")
+        logger.debug(f"Google Raw Event ID: {google_event.get('id')}")
+        logger.debug(f"Google Raw Summary: {google_event.get('summary')}")
+        logger.debug(f"Google Raw Start: {google_event.get('start')}")
+        logger.debug(f"Google Raw Recurrence: {google_event.get('recurrence')}")
+        logger.debug(f"Google Raw recurringEventId: {google_event.get('recurringEventId')}")
+        logger.debug(f"Google Raw originalStartTime: {google_event.get('originalStartTime')}")
+        
         private_props = google_event.get('extendedProperties', {}).get('private', {})
         
         # Extract start and end times
@@ -387,6 +425,18 @@ class EventModel:
                     rrule = rule.replace('RRULE:', '')
                     break
         
+        google_recurring_event_id = google_event.get('recurringEventId')
+        recurrence_id = None
+        if google_recurring_event_id:
+            original_start = google_event.get('originalStartTime', {})
+            if 'dateTime' in original_start:
+                dt = datetime.fromisoformat(original_start['dateTime'].replace('Z', '+00:00'))
+                recurrence_id = dt.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            elif 'date' in original_start:
+                recurrence_id = original_start['date'].replace('-', '')
+
+        is_master_event = 'recurrence' in google_event and not google_recurring_event_id
+
         return cls(
             uid=private_props.get('caldav-mirror-uid'),
             source_name=private_props.get('caldav-mirror-source'),
@@ -403,6 +453,10 @@ class EventModel:
             organizer_email=None,
             attendees=[],
             rrule=rrule,
+            recurrence_id=recurrence_id,
+            is_master_event=is_master_event,
+            google_recurring_event_id=google_event.get('recurringEventId'),
+            google_event_id=google_event.get('id'),
             sequence=google_event.get('sequence', 0),
             classification='PUBLIC' if google_event.get('visibility', 'public') == 'public' else google_event.get('visibility', 'PUBLIC').upper()
         )

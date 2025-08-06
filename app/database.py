@@ -10,7 +10,7 @@ import aiosqlite
 import json
 import uuid
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 import logging
 
@@ -40,13 +40,15 @@ class Database:
                 internal_id TEXT PRIMARY KEY,
                 source_name TEXT NOT NULL,
                 caldav_uid TEXT NOT NULL,
+                recurrence_id TEXT, -- For exceptions, this is the original start time of the instance
                 google_event_id TEXT,
                 event_hash TEXT NOT NULL,
                 event_data TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_synced TIMESTAMP,
-                UNIQUE(source_name, caldav_uid)
+                is_master_event BOOLEAN DEFAULT FALSE, -- Explicitly flag the master event
+                UNIQUE(source_name, caldav_uid, recurrence_id)
             )
         """)
         
@@ -79,51 +81,61 @@ class Database:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_events_google_id ON events(google_event_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_events_hash ON events(event_hash)")
     
-    async def store_event(self, source_name: str, caldav_uid: str, event_data: Dict[str, Any], 
-                         event_hash: str, google_event_id: Optional[str] = None) -> str:
-        """Store or update an event in the database."""
+    async def store_event(self, source_name: str, caldav_uid: str, recurrence_id: Optional[str],
+                          event_data: Dict[str, Any], event_hash: str, is_master_event: bool,
+                          google_event_id: Optional[str] = None) -> str:
+        """Store or update an event instance (master or exception) in the database."""
         internal_id = str(uuid.uuid4())
-        
+
         async with aiosqlite.connect(self.db_path) as db:
-            # Try to update existing event first
-            await db.execute("""
-                UPDATE events 
-                SET event_hash = ?, event_data = ?, google_event_id = ?, 
-                    updated_at = CURRENT_TIMESTAMP, last_synced = CURRENT_TIMESTAMP
-                WHERE source_name = ? AND caldav_uid = ?
-            """, (event_hash, json.dumps(event_data, default=str), google_event_id, source_name, caldav_uid))
+            # Correctly handle NULL for recurrence_id in WHERE clauses
+            where_clause = "source_name = ? AND caldav_uid = ? AND "
+            where_clause += "recurrence_id = ?" if recurrence_id is not None else "recurrence_id IS NULL"
             
+            where_params = (source_name, caldav_uid, recurrence_id) if recurrence_id is not None else (source_name, caldav_uid)
+
+            # Try to update existing event first
+            update_params = (event_hash, json.dumps(event_data, default=str), google_event_id, is_master_event, *where_params)
+            await db.execute(f"""
+                UPDATE events
+                SET event_hash = ?, event_data = ?, google_event_id = ?, is_master_event = ?,
+                    updated_at = CURRENT_TIMESTAMP, last_synced = CURRENT_TIMESTAMP
+                WHERE {where_clause}
+            """, update_params)
+
             if db.total_changes == 0:
                 # Insert new event
+                insert_params = (internal_id, source_name, caldav_uid, recurrence_id, event_hash,
+                                 json.dumps(event_data, default=str), google_event_id, is_master_event)
                 await db.execute("""
-                    INSERT INTO events (internal_id, source_name, caldav_uid, event_hash, 
-                                      event_data, google_event_id, last_synced)
-                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """, (internal_id, source_name, caldav_uid, event_hash, 
-                      json.dumps(event_data, default=str), google_event_id))
+                    INSERT INTO events (internal_id, source_name, caldav_uid, recurrence_id, event_hash,
+                                      event_data, google_event_id, is_master_event, last_synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, insert_params)
             else:
                 # Get the existing internal_id
-                cursor = await db.execute("""
-                    SELECT internal_id FROM events 
-                    WHERE source_name = ? AND caldav_uid = ?
-                """, (source_name, caldav_uid))
+                cursor = await db.execute(f"SELECT internal_id FROM events WHERE {where_clause}", where_params)
                 row = await cursor.fetchone()
                 if row:
                     internal_id = row[0]
-            
+
             await db.commit()
-        
+
         return internal_id
     
-    async def get_event_by_caldav_uid(self, source_name: str, caldav_uid: str) -> Optional[Dict[str, Any]]:
-        """Get an event by its CalDAV UID."""
+    async def get_event_instance(self, source_name: str, caldav_uid: str, recurrence_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Get a specific event instance by its CalDAV UID and recurrence ID."""
         async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-                SELECT internal_id, google_event_id, event_hash, event_data, last_synced
-                FROM events 
-                WHERE source_name = ? AND caldav_uid = ?
-            """, (source_name, caldav_uid))
-            
+            where_clause = "source_name = ? AND caldav_uid = ? AND "
+            where_clause += "recurrence_id = ?" if recurrence_id is not None else "recurrence_id IS NULL"
+            where_params = (source_name, caldav_uid, recurrence_id) if recurrence_id is not None else (source_name, caldav_uid)
+
+            cursor = await db.execute(f"""
+                SELECT internal_id, google_event_id, event_hash, event_data, last_synced, recurrence_id
+                FROM events
+                WHERE {where_clause}
+            """, where_params)
+
             row = await cursor.fetchone()
             if row:
                 return {
@@ -131,7 +143,8 @@ class Database:
                     'google_event_id': row[1],
                     'event_hash': row[2],
                     'event_data': json.loads(row[3]),
-                    'last_synced': row[4]
+                    'last_synced': row[4],
+                    'recurrence_id': row[5]
                 }
         return None
     
@@ -159,78 +172,93 @@ class Database:
             
             return events
 
-    async def get_all_events_for_source(self, source_name: str) -> Dict[str, Dict[str, Any]]:
+    async def get_all_events_for_source(self, source_name: str) -> Dict[Tuple[str, Optional[str]], Dict[str, Any]]:
         """
-        Get all events for a specific source, keyed by CalDAV UID.
+        Get all event instances for a specific source, keyed by (CalDAV UID, recurrence_id).
 
         Args:
             source_name: The name of the source.
 
         Returns:
-            A dictionary mapping CalDAV UIDs to event data.
+            A dictionary mapping (caldav_uid, recurrence_id) tuples to event data.
         """
         events = {}
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
-                SELECT caldav_uid, google_event_id, event_hash, event_data
+                SELECT caldav_uid, recurrence_id, google_event_id, event_hash, event_data
                 FROM events
                 WHERE source_name = ?
             """, (source_name,))
-            
+
             async for row in cursor:
-                events[row[0]] = {
-                    'google_event_id': row[1],
-                    'event_hash': row[2],
-                    'event_data': json.loads(row[3])
+                key = (row[0], row[1])
+                events[key] = {
+                    'google_event_id': row[2],
+                    'event_hash': row[3],
+                    'event_data': json.loads(row[4])
                 }
         return events
 
-    async def bulk_update_google_ids(self, source_name: str, uid_to_google_id_map: Dict[str, str]):
+    async def bulk_update_google_ids(self, source_name: str, instance_to_google_id_map: Dict[Tuple[str, Optional[str]], str]):
         """
-        Bulk update the google_event_id for a set of events.
+        Bulk update the google_event_id for a set of event instances.
 
         Args:
             source_name: The name of the source.
-            uid_to_google_id_map: A dictionary mapping CalDAV UID to Google event ID.
+            instance_to_google_id_map: A dictionary mapping (CalDAV UID, recurrence_id) to Google event ID.
         """
-        if not uid_to_google_id_map:
+        if not instance_to_google_id_map:
             return
 
-        update_tuples = [
-            (google_id, source_name, caldav_uid)
-            for caldav_uid, google_id in uid_to_google_id_map.items()
-        ]
+        master_updates = []
+        exception_updates = []
+
+        for (caldav_uid, recurrence_id), google_id in instance_to_google_id_map.items():
+            if recurrence_id is None:
+                master_updates.append((google_id, source_name, caldav_uid))
+            else:
+                exception_updates.append((google_id, source_name, caldav_uid, recurrence_id))
 
         async with aiosqlite.connect(self.db_path) as db:
-            await db.executemany("""
-                UPDATE events
-                SET google_event_id = ?
-                WHERE source_name = ? AND caldav_uid = ?
-            """, update_tuples)
+            if master_updates:
+                await db.executemany("""
+                    UPDATE events
+                    SET google_event_id = ?
+                    WHERE source_name = ? AND caldav_uid = ? AND recurrence_id IS NULL
+                """, master_updates)
+
+            if exception_updates:
+                await db.executemany("""
+                    UPDATE events
+                    SET google_event_id = ?
+                    WHERE source_name = ? AND caldav_uid = ? AND recurrence_id = ?
+                """, exception_updates)
+
             await db.commit()
             logger.info(f"Bulk updated {db.total_changes} Google event IDs for source {source_name}.")
     
-    async def delete_event(self, source_name: str, caldav_uid: str) -> Optional[str]:
-        """Delete an event and return its Google event ID if it exists."""
+    async def delete_event(self, source_name: str, caldav_uid: str, recurrence_id: Optional[str]) -> Optional[str]:
+        """Delete an event instance and return its Google event ID if it exists."""
         async with aiosqlite.connect(self.db_path) as db:
+            where_clause = "source_name = ? AND caldav_uid = ? AND "
+            where_clause += "recurrence_id = ?" if recurrence_id is not None else "recurrence_id IS NULL"
+            where_params = (source_name, caldav_uid, recurrence_id) if recurrence_id is not None else (source_name, caldav_uid)
+
             # Get Google event ID before deletion
-            cursor = await db.execute("""
-                SELECT google_event_id FROM events 
-                WHERE source_name = ? AND caldav_uid = ?
-            """, (source_name, caldav_uid))
-            
-            row = await cursor.fetchone()
-            google_event_id = row[0] if row else None
-            
-            # Delete the event
+            cursor = await db.execute(f"""
+                SELECT google_event_id FROM events
+                WHERE {where_clause}
+            """, where_params)
+    async def delete_event_series(self, source_name: str, caldav_uid: str):
+        """Delete all event instances for a given series UID."""
+        async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
-                DELETE FROM events 
+                DELETE FROM events
                 WHERE source_name = ? AND caldav_uid = ?
             """, (source_name, caldav_uid))
-            
             await db.commit()
-            
-            return google_event_id
+            if db.total_changes > 0:
+                logger.info(f"Deleted {db.total_changes} instances for event series {caldav_uid} from source {source_name}.")
     
     async def clear_all_events(self):
         """Delete all events from the database."""

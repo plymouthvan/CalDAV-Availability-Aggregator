@@ -39,19 +39,27 @@ class SyncManager:
 
             # 2. Process deletions in the database
             for uid in deleted_uids:
-                await self.db.delete_event(self.source_name, uid)
-            
+                # This now needs to handle deleting all instances for a given UID.
+                # A more robust implementation might mark them as deleted.
+                # For now, we assume a deleted UID means the whole series is gone.
+                logger.info(f"Deleting all instances for UID: {uid}")
+                await self.db.delete_event_series(self.source_name, uid)
+
             # 3. Process new and updated events in the database
             for event in new_events:
-                # Check if the event already exists to preserve the google_event_id
-                existing_event = await self.db.get_event_by_caldav_uid(self.source_name, event.uid)
+                # Check if the event instance already exists to preserve the google_event_id
+                existing_event = await self.db.get_event_instance(
+                    self.source_name, event.uid, event.recurrence_id
+                )
                 google_event_id = existing_event['google_event_id'] if existing_event else None
-                
+
                 await self.db.store_event(
                     self.source_name,
                     event.uid,
+                    event.recurrence_id,
                     event.to_dict(),
                     event.compute_hash(),
+                    event.is_master_event,
                     google_event_id=google_event_id
                 )
 
