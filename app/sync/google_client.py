@@ -282,11 +282,60 @@ class GoogleClient:
     async def batch_update_events(self, events_to_update: List[Tuple[str, EventModel]]) -> bool:
         if not events_to_update: return True
         logger.info(f"Batch updating {len(events_to_update)} Google events...")
-        # Implementation is correct
-        return True
+        batch_url = "https://www.googleapis.com/batch/calendar/v3"
+        headers = await self._get_auth_headers()
+        headers["Content-Type"] = "multipart/mixed; boundary=batch_boundary"
+
+        body = ""
+        for google_event_id, event in events_to_update:
+            event_data = event.to_google_event()
+            body += "--batch_boundary\n"
+            body += "Content-Type: application/http\n"
+            body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
+            body += f"PUT /calendar/v3/calendars/{self.calendar_id}/events/{google_event_id}\n"
+            body += "Content-Type: application/json\n\n"
+            body += json.dumps(event_data) + "\n"
+        body += "--batch_boundary--"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(batch_url, data=body.encode('utf-8'), headers=headers) as response:
+                    response_text = await response.text()
+                    if response.status == 200:
+                        logger.info(f"Batch update successful. Response: {response_text}")
+                        return True
+                    else:
+                        logger.error(f"Batch update failed: {response.status} - {response_text}")
+                        return False
+        except Exception as e:
+            logger.error(f"Error in batch update: {e}", exc_info=True)
+            return False
 
     async def batch_delete_events(self, google_event_ids: List[str]) -> bool:
         if not google_event_ids: return True
         logger.info(f"Batch deleting {len(google_event_ids)} Google events...")
-        # Implementation is correct
-        return True
+        batch_url = "https://www.googleapis.com/batch/calendar/v3"
+        headers = await self._get_auth_headers()
+        headers["Content-Type"] = "multipart/mixed; boundary=batch_boundary"
+
+        body = ""
+        for google_event_id in google_event_ids:
+            body += "--batch_boundary\n"
+            body += "Content-Type: application/http\n"
+            body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
+            body += f"DELETE /calendar/v3/calendars/{self.calendar_id}/events/{google_event_id}\n"
+        body += "--batch_boundary--"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(batch_url, data=body.encode('utf-8'), headers=headers) as response:
+                    response_text = await response.text()
+                    if response.status == 200:
+                        logger.info(f"Batch delete successful. Response: {response_text}")
+                        return True
+                    else:
+                        logger.error(f"Batch delete failed: {response.status} - {response_text}")
+                        return False
+        except Exception as e:
+            logger.error(f"Error in batch delete: {e}", exc_info=True)
+            return False

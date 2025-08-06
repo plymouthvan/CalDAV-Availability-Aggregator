@@ -95,7 +95,12 @@ class Reconciler:
             google_hash = google_model.compute_hash()
 
             if db_hash != google_hash:
-                logger.debug(f"[{source_name}] Change detected for {key}. DB hash: {db_hash}, Google hash: {google_hash}")
+                logger.info(
+                    f"[{source_name}] Change detected for event. "
+                    f"UID: {db_model.uid}, RecurrenceID: {db_model.recurrence_id}. "
+                    f"Google Event ID: {google_model.google_event_id}. "
+                    f"Old Hash: {google_hash}\nNew Hash: {db_hash}."
+                )
                 db_model.google_event_id = google_model.google_event_id
                 if db_model.recurrence_id:
                     master_key = (db_model.uid, None)
