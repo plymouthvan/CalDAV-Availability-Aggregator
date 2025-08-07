@@ -179,28 +179,23 @@ class GoogleClient:
         """Fetches all mirrored events (masters and instances) from Google Calendar."""
         logger.info(f"Listing all mirrored events for source: {source_name}")
         params = {
-            # 'privateExtendedProperty': f"caldav-mirror-source={source_name}",
-            'maxResults': 2500,
-            'singleEvents': 'false'
+            'privateExtendedProperty': f"caldav-mirror-source={source_name}",
+            'maxResults': 2500
         }
         items = await self._list_events_paginated(params)
 
         events = {}
         for item in items:
             private_props = item.get('extendedProperties', {}).get('private', {})
-            
-            # Client-side filtering to diagnose API issue
-            if private_props.get('caldav-mirror-source') != source_name:
-                continue
-
             uid = private_props.get('caldav-mirror-uid')
             if uid:
                 model = EventModel.from_google_event(item)
-                key = (uid, model.recurrence_id)
-                logger.debug(f"[Google KEY GEN] GID: {item.get('id')}, Key: {key}")
-                events[key] = item
+                if model:
+                    key = (uid, model.recurrence_id)
+                    logger.debug(f"[Google KEY GEN] GID: {item.get('id')}, Key: {key}")
+                    events[key] = item
         
-        logger.info(f"Found {len(events)} mirrored events (including instances) for source: {source_name}")
+        logger.info(f"Found {len(events)} mirrored events for source: {source_name}")
         return events
 
     async def get_event_instances(self, google_event_id: str) -> List[Dict[str, Any]]:

@@ -42,6 +42,7 @@ class EventModel:
     # Recurrence
     rrule: Optional[str] = None
     recurrence_id: Optional[str] = None
+    exdates: Optional[List[str]] = None
     is_master_event: bool = False
     google_recurring_event_id: Optional[str] = None # For exceptions, the master event's Google ID
     google_event_id: Optional[str] = None # The event's own Google ID
@@ -70,6 +71,11 @@ class EventModel:
             self.categories = []
         else:
             self.categories = sorted(self.categories)
+       
+        if self.exdates is None:
+            self.exdates = []
+        else:
+            self.exdates = sorted(self.exdates)
     
     @classmethod
     def from_icalendar(cls, ical_event, source_name: str) -> 'EventModel':
@@ -84,6 +90,7 @@ class EventModel:
             EventModel instance
         """
         logger.debug(f"--- Parsing iCalendar Event from {source_name} ---")
+        logger.debug(f"Raw VEVENT:\n{ical_event.to_ical().decode('utf-8')}")
         logger.debug(f"iCal Raw UID: {ical_event.get('UID')}")
         logger.debug(f"iCal Raw SUMMARY: {ical_event.get('SUMMARY')}")
         logger.debug(f"iCal Raw DTSTART: {ical_event.get('DTSTART').dt if ical_event.get('DTSTART') else 'N/A'}")
@@ -141,6 +148,25 @@ class EventModel:
             # Recurrence
             rrule = ical_event.get('RRULE').to_ical().decode('utf-8') if ical_event.get('RRULE') else None
             
+            exdates = []
+            exdate_prop = ical_event.get('EXDATE')
+            if exdate_prop:
+                if not isinstance(exdate_prop, list):
+                    exdate_prop = [exdate_prop]
+                for prop in exdate_prop:
+                    tzid = prop.params.get('TZID')
+                    for dt_prop in prop.dts:
+                        dt = dt_prop.dt
+                        if tzid:
+                            exdates.append(f"EXDATE;TZID={tzid}:{dt.strftime('%Y%m%dT%H%M%S')}")
+                        elif isinstance(dt, datetime):
+                             if dt.tzinfo:
+                                exdates.append(f"EXDATE:{dt.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
+                             else:
+                                exdates.append(f"EXDATE:{dt.strftime('%Y%m%dT%H%M%S')}Z")
+                        else: # date
+                            exdates.append(f"EXDATE;VALUE=DATE:{dt.strftime('%Y%m%d')}")
+
             recurrence_id_val = ical_event.get('RECURRENCE-ID')
             recurrence_id = None
             if recurrence_id_val:
@@ -189,7 +215,7 @@ class EventModel:
             
             classification = str(ical_event.get('CLASS', 'PUBLIC')).upper()
             
-            return cls(
+            model = cls(
                 uid=uid,
                 summary=summary,
                 description=description,
@@ -204,6 +230,7 @@ class EventModel:
                 status=status,
                 transparency=transparency,
                 rrule=rrule,
+                exdates=exdates,
                 recurrence_id=recurrence_id,
                 is_master_event=is_master_event,
                 attendees=attendees,
@@ -214,6 +241,14 @@ class EventModel:
                 classification=classification,
                 source_name=source_name
             )
+
+            if model.is_master_event:
+                logger.debug(f"--- Master Event Details ({source_name}) ---")
+                logger.debug(f"  RRULE: {model.rrule}")
+                logger.debug(f"  EXDATEs: {model.exdates}")
+                logger.debug(f"  Computed Hash: {model.compute_hash()}")
+            
+            return model
             
         except Exception as e:
             logger.error(f"Failed to parse iCalendar event: {e}")
@@ -274,7 +309,10 @@ class EventModel:
             google_event['recurringEventId'] = self.google_recurring_event_id
         elif self.rrule:
             # This is a master event with a recurrence rule
-            google_event['recurrence'] = [f'RRULE:{self.rrule}']
+            recurrence = [f'RRULE:{self.rrule}']
+            if self.exdates:
+                recurrence.extend(self.exdates)
+            google_event['recurrence'] = recurrence
 
         # Attendees
         if self.attendees:
@@ -353,6 +391,7 @@ class EventModel:
 
             'rrule': self.rrule,
             'recurrence_id': self.recurrence_id,
+            'exdates': sorted(self.exdates) if self.exdates else [],
             'is_master_event': self.is_master_event,
             'google_recurring_event_id': self.google_recurring_event_id,
             'categories': sorted(self.categories) if self.categories else [],

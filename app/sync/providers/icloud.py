@@ -23,6 +23,7 @@ class iCloudCalDAVClient(BaseCalDAVClient):
         super().__init__(name, url, username, password, database)
         self.sync_method = 'calendar-query'
         self._auth = aiohttp.BasicAuth(username, password)
+        logger.debug(f"Initialized iCloudCalDAVClient for source: {name}")
 
     async def sync_events(self) -> Tuple[List[EventModel], List[str], Optional[Dict[str, Any]]]:
         # iCloud supports sync-token, but we'll use calendar-query for robustness
@@ -71,7 +72,7 @@ class iCloudCalDAVClient(BaseCalDAVClient):
             return [], [], None
 
     async def _parse_calendar_query_response(self, xml_content: str) -> Tuple[List[EventModel], List[str], Optional[str]]:
-        events = []
+        raw_events = []
         try:
             root = ET.fromstring(xml_content)
             namespaces = {'D': 'DAV:', 'C': 'urn:ietf:params:xml:ns:caldav'}
@@ -82,11 +83,67 @@ class iCloudCalDAVClient(BaseCalDAVClient):
                         cal = Calendar.from_ical(calendar_data.text)
                         for component in cal.walk():
                             if component.name == "VEVENT":
-                                events.append(EventModel.from_icalendar(component, self.name))
+                                raw_events.append(component)
                     except Exception as e:
                         logger.error(f"Failed to parse calendar data: {e}")
         except ET.ParseError as e:
             logger.error(f"Failed to parse calendar query response: {e}")
+
+        # iCloud-specific logic to synthesize EXDATEs
+        master_events = {event.get('UID'): event for event in raw_events if event.get('RRULE')}
+        for event in raw_events:
+            if 'RECURRENCE-ID' in event:
+                uid = event.get('UID')
+                if uid in master_events:
+                    master = master_events[uid]
+                    recurrence_id = event.get('RECURRENCE-ID')
+                    if 'EXDATE' not in master:
+                        master['EXDATE'] = []
+                    
+                    # Ensure we don't add duplicate EXDATEs
+                    if not any(exdate.dts == [recurrence_id] for exdate in master['EXDATE']):
+                        master.add('EXDATE', recurrence_id.dt)
+                        logger.debug(f"Synthesized EXDATE for UID {uid} from RECURRENCE-ID {recurrence_id.dt}")
+
+        events = [EventModel.from_icalendar(component, self.name) for component in raw_events]
+        
+        # iCloud-specific logic to synthesize EXDATEs
+        master_events = {event.get('UID'): event for event in raw_events if event.get('RRULE')}
+        exceptions = [event for event in raw_events if 'RECURRENCE-ID' in event]
+        
+        logger.debug(f"Found {len(master_events)} master events and {len(exceptions)} exceptions.")
+
+        for event in exceptions:
+            uid = event.get('UID')
+            if uid in master_events:
+                master = master_events[uid]
+                recurrence_id = event.get('RECURRENCE-ID')
+                
+                # vRecur objects don't support direct list interface for EXDATEs
+                if 'EXDATE' not in master:
+                    master.add('EXDATE', []) # Initialize if not present
+                
+                # Convert recurrence_id to the same format as exdates for comparison
+                exdate_to_add = recurrence_id.dt
+                
+                # Check if the exdate is already present
+                is_present = False
+                if master.get('EXDATE'):
+                    # The property might return a single value or a list of values
+                    existing_exdates = master.get('EXDATE')
+                    if not isinstance(existing_exdates, list):
+                        existing_exdates = [existing_exdates]
+                    
+                    for exdate_prop in existing_exdates:
+                        if exdate_to_add in exdate_prop.dts:
+                            is_present = True
+                            break
+                
+                if not is_present:
+                    master.add('EXDATE', exdate_to_add)
+                    logger.debug(f"Synthesized EXDATE for UID {uid} from RECURRENCE-ID {exdate_to_add}")
+
+        events = [EventModel.from_icalendar(component, self.name) for component in raw_events]
         
         # We don't get deleted UIDs from this query, so we have to find them by comparing
         deleted_uids = await self._find_deleted_events(events)
