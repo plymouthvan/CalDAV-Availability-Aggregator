@@ -153,6 +153,7 @@ class EventModel:
                 else: # date object
                     recurrence_id = dt.strftime('%Y%m%d')
 
+            logger.debug(f"[CalDAV PARSE] Raw RECURRENCE-ID: {recurrence_id_val.dt if recurrence_id_val else 'None'} -> Parsed recurrence_id: {recurrence_id}")
             is_master_event = rrule is not None
 
             # Attendees
@@ -304,6 +305,7 @@ class EventModel:
                 }
             }
         
+        logger.debug(f"[Google PUSH] UID={self.uid}, RecurrenceID={self.recurrence_id} → Payload RecurringID={google_event.get('recurringEventId')}, OriginalStartTime={google_event.get('originalStartTime')}")
         return google_event
     
     def _map_status_to_google(self) -> str:
@@ -435,9 +437,11 @@ class EventModel:
             elif 'date' in original_start:
                 recurrence_id = original_start['date'].replace('-', '')
 
+            logger.debug(f"[Google PARSE] Raw originalStartTime: {google_event.get('originalStartTime')} -> Parsed recurrence_id: {recurrence_id}")
+
         is_master_event = 'recurrence' in google_event and not google_recurring_event_id
 
-        return cls(
+        event_model = cls(
             uid=private_props.get('caldav-mirror-uid'),
             source_name=private_props.get('caldav-mirror-source'),
             summary=google_event.get('summary'),
@@ -460,3 +464,5 @@ class EventModel:
             sequence=google_event.get('sequence', 0),
             classification='PUBLIC' if google_event.get('visibility', 'public') == 'public' else google_event.get('visibility', 'PUBLIC').upper()
         )
+        logger.debug(f"[Google PARSE] Event ID: {google_event.get('id')} → UID={event_model.uid}, RecurrenceID={event_model.recurrence_id}, recurringEventId={google_event.get('recurringEventId')}, originalStartTime={google_event.get('originalStartTime')}")
+        return event_model

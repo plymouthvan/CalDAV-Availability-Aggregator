@@ -43,11 +43,15 @@ class Reconciler:
             key: EventModel.from_dict(val['event_data'])
             for key, val in db_events_raw.items()
         }
+        for key, event in desired_instances.items():
+            logger.debug(f"[KEY GEN] Source Event Key: UID={event.uid}, RecurrenceID={event.recurrence_id}")
 
         google_instances = {
             key: EventModel.from_google_event(val)
             for key, val in google_events_raw.items()
         }
+        for key, event in google_instances.items():
+            logger.debug(f"[KEY GEN] Google Event Key: UID={event.uid}, RecurrenceID={event.recurrence_id}")
 
         db_keys = set(desired_instances.keys())
         google_keys = set(google_instances.keys())

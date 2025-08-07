@@ -231,6 +231,11 @@ class GoogleClient:
         body = ""
         for event in events:
             event_data = event.to_google_event()
+            logger.debug(f"Batch Create Payload for UID {event.uid}: {json.dumps(event_data, indent=2)}")
+            if event.is_master_event:
+                logger.debug(f"  Master Event Details: UID={event.uid}, Recurrence={event_data.get('recurrence')}")
+            elif event.recurrence_id:
+                logger.debug(f"  Exception Details: UID={event.uid}, RecurrenceID={event.recurrence_id}, recurringEventId={event_data.get('recurringEventId')}")
             body += "--batch_boundary\n"
             body += "Content-Type: application/http\n"
             body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
@@ -289,6 +294,11 @@ class GoogleClient:
         body = ""
         for google_event_id, event in events_to_update:
             event_data = event.to_google_event()
+            logger.debug(f"Batch Update Payload for GID {google_event_id} (UID {event.uid}): {json.dumps(event_data, indent=2)}")
+            if event.is_master_event:
+                logger.debug(f"  Master Event Details: UID={event.uid}, Recurrence={event_data.get('recurrence')}")
+            elif event.recurrence_id:
+                logger.debug(f"  Exception Details: UID={event.uid}, RecurrenceID={event.recurrence_id}, recurringEventId={event_data.get('recurringEventId')}")
             body += "--batch_boundary\n"
             body += "Content-Type: application/http\n"
             body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
