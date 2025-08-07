@@ -71,6 +71,11 @@ async def main():
     logger = setup_logger(level="DEBUG")
     logger.info("Starting CalDAV Mirror service...")
 
+    logging.getLogger("app.sync.event_model").setLevel(logging.DEBUG)
+    logging.getLogger("app.sync.reconciler").setLevel(logging.INFO)
+    logging.getLogger("app.sync.google_client").setLevel(logging.DEBUG)
+    logging.getLogger("aiosqlite").setLevel(logging.INFO)
+
     try:
         # 1. Load Configuration
         config = load_configuration()

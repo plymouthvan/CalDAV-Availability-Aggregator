@@ -301,7 +301,8 @@ class EventModel:
                 'private': {
                     'caldav-mirror-source': self.source_name,
                     'caldav-mirror-uid': self.uid,
-                    'caldav-mirror-hash': self.compute_hash()
+                    'caldav-mirror-hash': self.compute_hash(),
+                    'caldav-mirror-recurrence-id': self.recurrence_id or "master"
                 }
             }
         
@@ -428,16 +429,23 @@ class EventModel:
                     break
         
         google_recurring_event_id = google_event.get('recurringEventId')
-        recurrence_id = None
-        if google_recurring_event_id:
-            original_start = google_event.get('originalStartTime', {})
-            if 'dateTime' in original_start:
-                dt = datetime.fromisoformat(original_start['dateTime'].replace('Z', '+00:00'))
-                recurrence_id = dt.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-            elif 'date' in original_start:
-                recurrence_id = original_start['date'].replace('-', '')
+        recurrence_id = private_props.get('caldav-mirror-recurrence-id')
+        if recurrence_id == "master":
+            recurrence_id = None
 
-            logger.debug(f"[Google PARSE] Raw originalStartTime: {google_event.get('originalStartTime')} -> Parsed recurrence_id: {recurrence_id}")
+        # Fallback for events created before this change
+        if not recurrence_id and google_event.get('recurringEventId'):
+             original_start_time = google_event.get('originalStartTime')
+             if original_start_time:
+                 if 'dateTime' in original_start_time:
+                     dt = datetime.fromisoformat(original_start_time['dateTime'].replace('Z', '+00:00'))
+                     recurrence_id = dt.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+                 elif 'date' in original_start_time:
+                     recurrence_id = original_start_time['date'].replace('-', '')
+                 logger.debug(f"[Google PARSE] Fallback to originalStartTime: {original_start_time} -> Parsed recurrence_id: {recurrence_id}")
+             else:
+                logger.warning(f"Google event {google_event.get('id')} is an exception but has no recurrence identifier. Skipping.")
+                return None # Or handle as an error
 
         is_master_event = 'recurrence' in google_event and not google_recurring_event_id
 
