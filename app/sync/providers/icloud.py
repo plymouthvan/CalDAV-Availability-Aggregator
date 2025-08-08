@@ -91,24 +91,6 @@ class iCloudCalDAVClient(BaseCalDAVClient):
 
         # iCloud-specific logic to synthesize EXDATEs
         master_events = {event.get('UID'): event for event in raw_events if event.get('RRULE')}
-        for event in raw_events:
-            if 'RECURRENCE-ID' in event:
-                uid = event.get('UID')
-                if uid in master_events:
-                    master = master_events[uid]
-                    recurrence_id = event.get('RECURRENCE-ID')
-                    if 'EXDATE' not in master:
-                        master['EXDATE'] = []
-                    
-                    # Ensure we don't add duplicate EXDATEs
-                    if not any(exdate.dts == [recurrence_id] for exdate in master['EXDATE']):
-                        master.add('EXDATE', recurrence_id.dt)
-                        logger.debug(f"Synthesized EXDATE for UID {uid} from RECURRENCE-ID {recurrence_id.dt}")
-
-        events = [EventModel.from_icalendar(component, self.name) for component in raw_events]
-        
-        # iCloud-specific logic to synthesize EXDATEs
-        master_events = {event.get('UID'): event for event in raw_events if event.get('RRULE')}
         exceptions = [event for event in raw_events if 'RECURRENCE-ID' in event]
         
         logger.debug(f"Found {len(master_events)} master events and {len(exceptions)} exceptions.")
@@ -116,34 +98,44 @@ class iCloudCalDAVClient(BaseCalDAVClient):
         for event in exceptions:
             uid = event.get('UID')
             if uid in master_events:
-                master = master_events[uid]
-                recurrence_id = event.get('RECURRENCE-ID')
-                
-                # vRecur objects don't support direct list interface for EXDATEs
-                if 'EXDATE' not in master:
-                    master.add('EXDATE', []) # Initialize if not present
-                
-                # Convert recurrence_id to the same format as exdates for comparison
-                exdate_to_add = recurrence_id.dt
-                
-                # Check if the exdate is already present
-                is_present = False
-                if master.get('EXDATE'):
-                    # The property might return a single value or a list of values
-                    existing_exdates = master.get('EXDATE')
-                    if not isinstance(existing_exdates, list):
-                        existing_exdates = [existing_exdates]
+                # An exception with a 'CANCELLED' status is how iCloud marks a deleted instance.
+                # We must synthesize an EXDATE on the master event to reflect this.
+                if str(event.get('STATUS', 'CONFIRMED')).upper() == 'CANCELLED':
+                    master = master_events[uid]
+                    recurrence_id = event.get('RECURRENCE-ID')
                     
-                    for exdate_prop in existing_exdates:
-                        if exdate_to_add in exdate_prop.dts:
-                            is_present = True
-                            break
-                
-                if not is_present:
-                    master.add('EXDATE', exdate_to_add)
-                    logger.debug(f"Synthesized EXDATE for UID {uid} from RECURRENCE-ID {exdate_to_add}")
+                    if not recurrence_id:
+                        continue
 
-        events = [EventModel.from_icalendar(component, self.name) for component in raw_events]
+                    # Ensure exdate property exists
+                    if 'EXDATE' not in master:
+                        master.add('EXDATE', [])
+                    
+                    exdate_dt = recurrence_id.dt
+                    
+                    # Check if already excluded
+                    is_excluded = False
+                    exdates = master.get('exdate')
+                    if exdates:
+                        if not isinstance(exdates, list):
+                            exdates = [exdates] # Handle single exdate case
+                        for exdate_prop in exdates:
+                            if exdate_dt in exdate_prop.dts:
+                                is_excluded = True
+                                break
+                    
+                    if not is_excluded:
+                        master.add('EXDATE', exdate_dt)
+                        logger.debug(f"Synthesized EXDATE for UID {uid} from CANCELLED exception with RECURRENCE-ID {exdate_dt}")
+
+        # Filter out cancelled events, as their purpose (adding an EXDATE) is now fulfilled.
+        # This prevents them from being treated as active events to be created in Google.
+        final_components = [
+            event for event in raw_events
+            if str(event.get('STATUS', 'CONFIRMED')).upper() != 'CANCELLED'
+        ]
+
+        events = [EventModel.from_icalendar(component, self.name) for component in final_components]
         
         # We don't get deleted UIDs from this query, so we have to find them by comparing
         deleted_uids = await self._find_deleted_events(events)

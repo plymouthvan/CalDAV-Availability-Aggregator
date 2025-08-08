@@ -2,6 +2,7 @@
 aiohttp
 aiosqlite
 icalendar
+pytz
 pyyaml
 python-dotenv
 

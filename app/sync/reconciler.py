@@ -113,6 +113,78 @@ class Reconciler:
                         db_model.google_recurring_event_id = master_gcal_event.google_event_id
                 to_update.append((db_model.google_event_id, db_model))
 
+        # --- Orphan Sweep Step ---
+        all_uids = {key[0] for key in db_keys | google_keys}
+        orphans_to_delete_gids = set()
+        orphans_to_delete_keys = set()
+
+        for uid in all_uids:
+            # 1. Build source and google exception sets for the current UID
+            source_master = desired_instances.get((uid, None))
+            source_exdates = {exdate.strftime('%Y%m%d') for exdate in source_master.exdates} if source_master and source_master.exdates else set()
+            
+            source_exceptions = {
+                key[1] for key in db_keys if key[0] == uid and key[1] is not None
+            }
+            
+            google_exceptions = [
+                g_event for g_key, g_event in google_instances.items()
+                if g_key[0] == uid and g_event.recurrence_id is not None
+            ]
+
+            # 2. Compute delete candidates
+            delete_candidates = []
+
+            for g_event in google_exceptions:
+                rid = g_event.recurrence_id
+                rid_date_str = ""
+                if rid:
+                    try:
+                        # Normalize recurrence ID to YYYYMMDD format for comparison with EXDATEs
+                        rid_dt = datetime.strptime(rid, '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc)
+                        rid_date_str = rid_dt.strftime('%Y%m%d')
+                    except (ValueError, TypeError):
+                        try:
+                            rid_dt = datetime.strptime(rid, '%Y%m%d').replace(tzinfo=timezone.utc)
+                            rid_date_str = rid_dt.strftime('%Y%m%d')
+                        except (ValueError, TypeError):
+                             logger.warning(f"[{source_name}] Could not parse recurrence_id '{rid}' for UID {uid}")
+                             continue
+
+                # A: exceptions where rid is in source_exdates
+                if rid_date_str and rid_date_str in source_exdates:
+                    delete_candidates.append((g_event, "EXDATE found in source master"))
+                    continue
+
+                # B: exceptions where rid is not in source_exceptions
+                if rid not in source_exceptions:
+                    delete_candidates.append((g_event, "Recurrence ID not found in source exceptions"))
+                    continue
+            
+            # C: Tagged, standalone Google events with our extProps
+            standalone_google_events = [
+                g_event for g_key, g_event in google_instances.items()
+                if g_key[0] == uid and g_event.google_recurring_event_id is None and g_event.recurrence_id is not None
+            ]
+            for g_event in standalone_google_events:
+                 if g_event.recurrence_id not in source_exceptions:
+                    delete_candidates.append((g_event, "Standalone Google event not in source exceptions"))
+
+            # 3. Log and prepare for deletion
+            if delete_candidates:
+                plan_log = f"[{source_name}] [ORPHAN_DELETE_PLAN] UID: {uid}\n"
+                for g_event, reason in delete_candidates:
+                    plan_log += f"  - Deleting GID: {g_event.google_event_id}, RID: {g_event.recurrence_id}. Reason: {reason}\n"
+                    orphans_to_delete_gids.add(g_event.google_event_id)
+                    orphans_to_delete_keys.add((uid, g_event.recurrence_id))
+                logger.info(plan_log)
+
+        if orphans_to_delete_gids:
+            to_delete.extend(list(orphans_to_delete_gids))
+            # We also need to ensure these are removed from the DB tracking.
+            # This assumes the main deletion logic will handle DB removal.
+            # If not, we would call: await self.db.bulk_delete_events(source_name, orphans_to_delete_keys)
+
         logger.info(f"Reconciliation plan: {len(to_create)} create, {len(to_update)} update, {len(to_delete)} delete.")
 
         if to_create:

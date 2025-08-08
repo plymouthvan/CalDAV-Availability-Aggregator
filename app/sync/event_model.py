@@ -6,8 +6,10 @@ Provides normalized event representation and hashing for deduplication.
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
+import pytz
 from typing import Dict, Any, Optional, List
+from icalendar import Calendar
 from dataclasses import dataclass, asdict
 import logging
 
@@ -42,7 +44,7 @@ class EventModel:
     # Recurrence
     rrule: Optional[str] = None
     recurrence_id: Optional[str] = None
-    exdates: Optional[List[str]] = None
+    exdates: Optional[List[datetime]] = None
     is_master_event: bool = False
     google_recurring_event_id: Optional[str] = None # For exceptions, the master event's Google ID
     google_event_id: Optional[str] = None # The event's own Google ID
@@ -90,7 +92,6 @@ class EventModel:
             EventModel instance
         """
         logger.debug(f"--- Parsing iCalendar Event from {source_name} ---")
-        logger.debug(f"Raw VEVENT:\n{ical_event.to_ical().decode('utf-8')}")
         logger.debug(f"iCal Raw UID: {ical_event.get('UID')}")
         logger.debug(f"iCal Raw SUMMARY: {ical_event.get('SUMMARY')}")
         logger.debug(f"iCal Raw DTSTART: {ical_event.get('DTSTART').dt if ical_event.get('DTSTART') else 'N/A'}")
@@ -154,18 +155,12 @@ class EventModel:
                 if not isinstance(exdate_prop, list):
                     exdate_prop = [exdate_prop]
                 for prop in exdate_prop:
-                    tzid = prop.params.get('TZID')
-                    for dt_prop in prop.dts:
-                        dt = dt_prop.dt
-                        if tzid:
-                            exdates.append(f"EXDATE;TZID={tzid}:{dt.strftime('%Y%m%dT%H%M%S')}")
-                        elif isinstance(dt, datetime):
-                             if dt.tzinfo:
-                                exdates.append(f"EXDATE:{dt.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
-                             else:
-                                exdates.append(f"EXDATE:{dt.strftime('%Y%m%dT%H%M%S')}Z")
-                        else: # date
-                            exdates.append(f"EXDATE;VALUE=DATE:{dt.strftime('%Y%m%d')}")
+                    for dt_val in prop.dts:
+                        dt = dt_val.dt
+                        if isinstance(dt, datetime):
+                            exdates.append(dt)
+                        elif isinstance(dt, date):
+                            exdates.append(datetime.combine(dt, datetime.min.time()))
 
             recurrence_id_val = ical_event.get('RECURRENCE-ID')
             recurrence_id = None
@@ -242,11 +237,6 @@ class EventModel:
                 source_name=source_name
             )
 
-            if model.is_master_event:
-                logger.debug(f"--- Master Event Details ({source_name}) ---")
-                logger.debug(f"  RRULE: {model.rrule}")
-                logger.debug(f"  EXDATEs: {model.exdates}")
-                logger.debug(f"  Computed Hash: {model.compute_hash()}")
             
             return model
             
@@ -311,7 +301,24 @@ class EventModel:
             # This is a master event with a recurrence rule
             recurrence = [f'RRULE:{self.rrule}']
             if self.exdates:
-                recurrence.extend(self.exdates)
+                try:
+                    event_tz = pytz.timezone(self.timezone) if self.timezone else timezone.utc
+                except pytz.UnknownTimeZoneError:
+                    logger.warning(f"Unknown timezone '{self.timezone}', falling back to UTC.")
+                    event_tz = timezone.utc
+
+                for exdate_dt in self.exdates:
+                    # Check if it's an all-day event by seeing if it's midnight and naive
+                    if exdate_dt.hour == 0 and exdate_dt.minute == 0 and exdate_dt.second == 0 and not exdate_dt.tzinfo:
+                        exdate_str = f"EXDATE;VALUE=DATE:{exdate_dt.strftime('%Y%m%d')}"
+                    else:
+                        # Ensure datetime is localized before formatting
+                        if not exdate_dt.tzinfo:
+                            local_dt = event_tz.localize(exdate_dt)
+                        else:
+                            local_dt = exdate_dt.astimezone(event_tz)
+                        exdate_str = f"EXDATE;TZID={event_tz.zone}:{local_dt.strftime('%Y%m%dT%H%M%S')}"
+                    recurrence.append(exdate_str)
             google_event['recurrence'] = recurrence
 
         # Attendees
@@ -391,7 +398,7 @@ class EventModel:
 
             'rrule': self.rrule,
             'recurrence_id': self.recurrence_id,
-            'exdates': sorted(self.exdates) if self.exdates else [],
+            'exdates': sorted([dt.isoformat() for dt in self.exdates]) if self.exdates else [],
             'is_master_event': self.is_master_event,
             'google_recurring_event_id': self.google_recurring_event_id,
             'categories': sorted(self.categories) if self.categories else [],
@@ -403,6 +410,9 @@ class EventModel:
         json_str = json.dumps(hash_data, sort_keys=True, default=str)
         
         # Return SHA-256 hash
+        hash_val = hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+
+
         return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
     
     def to_dict(self) -> Dict[str, Any]:
@@ -422,6 +432,9 @@ class EventModel:
         if data.get('last_modified') and isinstance(data['last_modified'], str):
             data['last_modified'] = datetime.fromisoformat(data['last_modified'])
         
+        if data.get('exdates') and isinstance(data['exdates'], list):
+            data['exdates'] = [datetime.fromisoformat(dt) if isinstance(dt, str) else dt for dt in data['exdates']]
+
         return cls(**data)
 
     @classmethod
@@ -459,13 +472,28 @@ class EventModel:
         if end_datetime and isinstance(end_datetime, str):
             end_datetime = datetime.fromisoformat(end_datetime.replace('Z', '+00:00'))
 
-        # Extract recurrence rule
+        # Extract recurrence rule and exdates
         rrule = None
+        exdates = []
         if 'recurrence' in google_event:
             for rule in google_event['recurrence']:
                 if rule.startswith('RRULE:'):
                     rrule = rule.replace('RRULE:', '')
-                    break
+                elif rule.startswith('EXDATE'):
+                    try:
+                        # Use icalendar to robustly parse the EXDATE string
+                        dummy_cal = Calendar.from_ical(f"BEGIN:VCALENDAR\nBEGIN:VEVENT\n{rule}\nEND:VEVENT\nEND:VCALENDAR")
+                        exdate_prop = dummy_cal.walk('VEVENT')[0].get('exdate')
+                        props = exdate_prop if isinstance(exdate_prop, list) else [exdate_prop]
+                        for prop in props:
+                            for dt_val in prop.dts:
+                                dt = dt_val.dt
+                                if isinstance(dt, datetime):
+                                    exdates.append(dt)
+                                elif isinstance(dt, date):
+                                    exdates.append(datetime.combine(dt, datetime.min.time()))
+                    except Exception as e:
+                        logger.warning(f"Could not parse EXDATE rule from Google: '{rule}'. Error: {e}")
         
         google_recurring_event_id = google_event.get('recurringEventId')
         recurrence_id = private_props.get('caldav-mirror-recurrence-id')
@@ -504,6 +532,7 @@ class EventModel:
             organizer_email=None,
             attendees=[],
             rrule=rrule,
+            exdates=exdates,
             recurrence_id=recurrence_id,
             is_master_event=is_master_event,
             google_recurring_event_id=google_event.get('recurringEventId'),

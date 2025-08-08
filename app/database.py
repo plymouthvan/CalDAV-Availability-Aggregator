@@ -199,6 +199,28 @@ class Database:
                 }
         return events
 
+    async def get_all_event_instances_for_uid(self, source_name: str, caldav_uid: str) -> List[Dict[str, Any]]:
+        """
+        Get all event instances (master and exceptions) for a specific CalDAV UID.
+        """
+        instances = []
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                SELECT caldav_uid, recurrence_id, google_event_id, event_hash, event_data
+                FROM events
+                WHERE source_name = ? AND caldav_uid = ?
+            """, (source_name, caldav_uid))
+
+            async for row in cursor:
+                instances.append({
+                    'caldav_uid': row[0],
+                    'recurrence_id': row[1],
+                    'google_event_id': row[2],
+                    'event_hash': row[3],
+                    'event_data': json.loads(row[4])
+                })
+        return instances
+
     async def bulk_update_google_ids(self, source_name: str, instance_to_google_id_map: Dict[Tuple[str, Optional[str]], str]):
         """
         Bulk update the google_event_id for a set of event instances.
