@@ -95,6 +95,54 @@ class iCloudCalDAVClient(BaseCalDAVClient):
         
         logger.debug(f"Found {len(master_events)} master events and {len(exceptions)} exceptions.")
 
+        # Diagnostics: log master anchors and exception RECURRENCE-ID params (e.g., RANGE=THISANDFUTURE)
+        try:
+            # Masters
+            for uid_key, master in master_events.items():
+                try:
+                    dtstart_prop = master.get('DTSTART')
+                    dtstart_dt = getattr(dtstart_prop, 'dt', None) if dtstart_prop else None
+                    dtstart_params = getattr(dtstart_prop, 'params', {}) if dtstart_prop else {}
+                    rrule_prop = master.get('RRULE')
+                    rrule_str = None
+                    if rrule_prop:
+                        try:
+                            rrule_str = rrule_prop.to_ical().decode('utf-8')
+                        except Exception:
+                            rrule_str = str(rrule_prop)
+                    logger.debug(
+                        f"[iCloud PARSE][MASTER] UID={str(uid_key)}, DTSTART={dtstart_dt}, "
+                        f"DTSTART-params={dict(dtstart_params) if hasattr(dtstart_params, 'items') else dtstart_params}, "
+                        f"RRULE={rrule_str}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[iCloud PARSE][MASTER] Logging failed for UID={str(uid_key)}: {e}")
+
+            # Exceptions
+            for ex in exceptions:
+                try:
+                    uid_prop = ex.get('UID')
+                    uid_val = str(uid_prop) if uid_prop is not None else None
+                    rid_prop = ex.get('RECURRENCE-ID')
+                    rid_dt = getattr(rid_prop, 'dt', None) if rid_prop else None
+                    rid_params = getattr(rid_prop, 'params', {}) if rid_prop else {}
+                    rng = rid_params.get('RANGE') if hasattr(rid_params, 'get') else None
+                    status_val = str(ex.get('STATUS', '')).upper() if ex.get('STATUS') else None
+                    ex_dtstart_prop = ex.get('DTSTART')
+                    ex_dtstart_dt = getattr(ex_dtstart_prop, 'dt', None) if ex_dtstart_prop else None
+
+                    logger.debug(
+                        f"[iCloud PARSE][EXCEPTION] UID={uid_val}, RECURRENCE-ID={rid_dt}, "
+                        f"RID-params={dict(rid_params) if hasattr(rid_params, 'items') else rid_params}, "
+                        f"STATUS={status_val}, DTSTART={ex_dtstart_dt}"
+                    )
+                    if rng:
+                        logger.info(f"[iCloud PARSE][RANGE] UID={uid_val}, RANGE={rng}, RID={rid_dt}")
+                except Exception as e:
+                    logger.warning(f"[iCloud PARSE][EXCEPTION] Logging failed: {e}")
+        except Exception as e:
+            logger.warning(f"[iCloud PARSE] Diagnostic logging failed: {e}")
+
         for event in exceptions:
             uid = event.get('UID')
             if uid in master_events:
