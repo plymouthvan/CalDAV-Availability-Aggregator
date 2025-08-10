@@ -294,10 +294,11 @@ class Reconciler:
             # If not, we would call: await self.db.bulk_delete_events(source_name, orphans_to_delete_keys)
 
         # --- Ordered execution to avoid invalid exception creations ---
-        masters_to_create: List[EventModel] = [e for e in to_create if e.is_master_event]
+        # Treat all non-exception events (masters and non-recurring) as "primary"
+        primary_to_create: List[EventModel] = [e for e in to_create if not e.recurrence_id]
         exceptions_to_create: List[EventModel] = [e for e in to_create if e.recurrence_id]
 
-        masters_to_update: List[Tuple[str, EventModel]] = [(gid, e) for (gid, e) in to_update if e.is_master_event]
+        primary_to_update: List[Tuple[str, EventModel]] = [(gid, e) for (gid, e) in to_update if not e.recurrence_id]
         exceptions_to_update: List[Tuple[str, EventModel]] = [(gid, e) for (gid, e) in to_update if e.recurrence_id]
 
         # De-duplicate deletes to avoid "cannotOperateOnSameResourceMultipleTimesInBatch".
@@ -305,17 +306,17 @@ class Reconciler:
 
         logger.info(
             f"Reconciliation plan: {len(to_create)} create, {len(to_update)} update, {len(to_delete_dedup)} delete. "
-            f"(masters_create={len(masters_to_create)}, exceptions_create={len(exceptions_to_create)}, "
-            f"masters_update={len(masters_to_update)}, exceptions_update={len(exceptions_to_update)})"
+            f"(primary_create={len(primary_to_create)}, exceptions_create={len(exceptions_to_create)}, "
+            f"primary_update={len(primary_to_update)}, exceptions_update={len(exceptions_to_update)})"
         )
 
-        # 1) Update masters first so their RRULE/anchor is correct before touching exceptions
-        if masters_to_update:
-            await self.google.batch_update_events(masters_to_update)
+        # 1) Update primary (masters and non-recurring) first
+        if primary_to_update:
+            await self.google.batch_update_events(primary_to_update)
 
-        # 2) Create masters (rare during steady-state, but keep ordering correct)
-        if masters_to_create:
-            created_map = await self.google.batch_create_events(masters_to_create)
+        # 2) Create primary next
+        if primary_to_create:
+            created_map = await self.google.batch_create_events(primary_to_create)
             if created_map:
                 await self.db.bulk_update_google_ids(source_name, created_map)
 
@@ -323,7 +324,7 @@ class Reconciler:
         if exceptions_to_update:
             await self.google.batch_update_events(exceptions_to_update)
 
-        # 4) Create exceptions after masters are settled
+        # 4) Create exceptions after primary are settled
         if exceptions_to_create:
             created_map = await self.google.batch_create_events(exceptions_to_create)
             if created_map:
