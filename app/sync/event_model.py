@@ -297,15 +297,38 @@ class EventModel:
         if self.google_recurring_event_id:
             # This is an exception, link it to the master event in Google
             google_event['recurringEventId'] = self.google_recurring_event_id
+
+            # Provide originalStartTime so Google overrides the correct generated instance
+            if self.recurrence_id:
+                try:
+                    rid = self.recurrence_id
+                    if len(rid) == 8 and rid.isdigit():
+                        # Date-only RECURRENCE-ID (all-day or date-based instance)
+                        google_event['originalStartTime'] = {
+                            'date': f"{rid[0:4]}-{rid[4:6]}-{rid[6:8]}"
+                        }
+                    else:
+                        # Date-time RECURRENCE-ID. Accept both forms with and without trailing Z.
+                        if rid.endswith('Z'):
+                            dt = datetime.strptime(rid, '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc)
+                        else:
+                            dt = datetime.strptime(rid, '%Y%m%dT%H%M%S').replace(tzinfo=timezone.utc)
+                        google_event['originalStartTime'] = {
+                            'dateTime': dt.isoformat().replace('+00:00', 'Z'),
+                            'timeZone': 'UTC'
+                        }
+                    logger.debug(f"[Google PUSH] Set originalStartTime for exception UID={self.uid}, RecurrenceID={self.recurrence_id}: {google_event.get('originalStartTime')}")
+                except Exception as e:
+                    logger.warning(f"[Google PUSH] Failed to set originalStartTime for UID={self.uid}, RecurrenceID={self.recurrence_id}: {e}")
         elif self.rrule:
             # This is a master event with a recurrence rule
             recurrence = [f'RRULE:{self.rrule}']
             if self.exdates:
                 try:
-                    event_tz = pytz.timezone(self.timezone) if self.timezone else timezone.utc
+                    event_tz = pytz.timezone(self.timezone) if self.timezone else pytz.UTC
                 except pytz.UnknownTimeZoneError:
                     logger.warning(f"Unknown timezone '{self.timezone}', falling back to UTC.")
-                    event_tz = timezone.utc
+                    event_tz = pytz.UTC
 
                 for exdate_dt in self.exdates:
                     # Check if it's an all-day event by seeing if it's midnight and naive
@@ -320,6 +343,8 @@ class EventModel:
                         exdate_str = f"EXDATE;TZID={event_tz.zone}:{local_dt.strftime('%Y%m%dT%H%M%S')}"
                     recurrence.append(exdate_str)
             google_event['recurrence'] = recurrence
+            # DIAG: Log the recurrence array including any EXDATEs to observe suppression strategy.
+            logger.debug(f"[Google PUSH][DIAG] Built recurrence for master UID={self.uid}: {recurrence}")
 
         # Attendees
         if self.attendees:
@@ -336,7 +361,8 @@ class EventModel:
         if self.classification == 'PRIVATE':
             google_event['visibility'] = 'private'
         elif self.classification == 'CONFIDENTIAL':
-            google_event['visibility'] = 'confidential'
+            # Google does not support 'confidential' visibility; map to 'private'
+            google_event['visibility'] = 'private'
         else:
             google_event['visibility'] = 'public'
 

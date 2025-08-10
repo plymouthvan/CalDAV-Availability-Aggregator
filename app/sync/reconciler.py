@@ -94,7 +94,34 @@ class Reconciler:
         for key in to_compare_keys:
             db_model = desired_instances[key]
             google_model = google_instances[key]
-            
+
+            # If desired is an exception but the Google event is standalone (no recurringEventId),
+            # replace via delete-and-create so the new exception is anchored by originalStartTime.
+            if db_model.recurrence_id and not google_model.google_recurring_event_id:
+                master_key = (db_model.uid, None)
+                master_gcal_event = google_instances.get(master_key)
+                if master_gcal_event and master_gcal_event.google_event_id:
+                    new_event = EventModel.from_dict(db_model.to_dict())
+                    new_event.google_event_id = None
+                    new_event.google_recurring_event_id = master_gcal_event.google_event_id
+                    to_delete.append(google_model.google_event_id)
+                    to_create.append(new_event)
+                    logger.info(
+                        f"[{source_name}] Converting standalone exception to linked exception. "
+                        f"UID: {db_model.uid}, RecurrenceID: {db_model.recurrence_id}. "
+                        f"Delete GID: {google_model.google_event_id} then create linked exception under master {master_gcal_event.google_event_id}."
+                    )
+                    continue
+                else:
+                    logger.warning(f"[{source_name}] Cannot convert exception {key} because master is not present in Google.")
+
+            # Ensure desired exceptions carry the master recurringEventId BEFORE hashing
+            if db_model.recurrence_id and not db_model.google_recurring_event_id:
+                master_key = (db_model.uid, None)
+                master_gcal_event = google_instances.get(master_key)
+                if master_gcal_event and master_gcal_event.google_event_id:
+                    db_model.google_recurring_event_id = master_gcal_event.google_event_id
+
             db_hash = db_model.compute_hash()
             google_hash = google_model.compute_hash()
 
@@ -106,7 +133,7 @@ class Reconciler:
                     f"Old Hash: {google_hash}\nNew Hash: {db_hash}."
                 )
                 db_model.google_event_id = google_model.google_event_id
-                if db_model.recurrence_id:
+                if db_model.recurrence_id and not db_model.google_recurring_event_id:
                     master_key = (db_model.uid, None)
                     master_gcal_event = google_instances.get(master_key)
                     if master_gcal_event:

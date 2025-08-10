@@ -249,6 +249,11 @@ class GoogleClient:
                 logger.debug(f"  Master Event Details: UID={event.uid}, Recurrence={event_data.get('recurrence')}")
             elif event.recurrence_id:
                 logger.debug(f"  Exception Details: UID={event.uid}, RecurrenceID={event.recurrence_id}, recurringEventId={event_data.get('recurringEventId')}")
+                # DIAG: Exceptions should include originalStartTime to suppress the generated instance
+                if 'originalStartTime' not in event_data:
+                    logger.warning(f"[Google PUSH][DIAG] Batch create exception missing originalStartTime: UID={event.uid}, RecurrenceID={event.recurrence_id}, recurringEventId={event_data.get('recurringEventId')}")
+                else:
+                    logger.debug(f"[Google PUSH][DIAG] Batch create exception has originalStartTime: UID={event.uid}, RecurrenceID={event.recurrence_id}, originalStartTime={event_data.get('originalStartTime')}")
             body += "--batch_boundary\n"
             body += "Content-Type: application/http\n"
             body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
@@ -281,6 +286,29 @@ class GoogleClient:
         
         event_idx = 0
         for part in parts:
+            # DIAG: Extract per-part status and content-id for better visibility
+            status_code = None
+            content_id = None
+            for line in part.splitlines():
+                if line.startswith('HTTP/1.1 '):
+                    try:
+                        status_code = int(line.split()[1])
+                    except Exception:
+                        status_code = None
+                if line.lower().startswith('content-id:'):
+                    content_id = line.split(':', 1)[1].strip()
+
+            # Attempt to correlate to original event using current index prior to increment
+            ev = original_events[event_idx] if event_idx < len(original_events) else None
+            ev_uid = ev.uid if ev else None
+            ev_rid = ev.recurrence_id if ev else None
+
+            if status_code is not None:
+                if status_code != 200:
+                    logger.warning(f"[BATCH CREATE][DIAG] Non-200 part. Status={status_code}, Content-ID={content_id}, For UID={ev_uid}, RID={ev_rid}. Part snippet: {part[:500]}")
+                else:
+                    logger.debug(f"[BATCH CREATE][DIAG] 200 OK part for UID={ev_uid}, RID={ev_rid}, Content-ID={content_id}")
+
             if '"id":' in part and '200 OK' in part:
                 try:
                     json_part = part[part.find('{'):part.rfind('}') + 1]
@@ -290,7 +318,13 @@ class GoogleClient:
                         key = (event.uid, event.recurrence_id)
                         results[key] = data['id']
                 except json.JSONDecodeError:
+                    logger.warning(f"[BATCH CREATE][DIAG] JSON decode failed for UID={ev_uid}, RID={ev_rid}. Part snippet: {part[:500]}")
                     continue
+            else:
+                # DIAG: 200 OK but no 'id' found can indicate an error payload or partial failure
+                if status_code == 200 and '"id":' not in part:
+                    logger.debug(f"[BATCH CREATE][DIAG] 200 OK part without id for UID={ev_uid}, RID={ev_rid}. Part snippet: {part[:300]}")
+
             if 'Content-ID' in part:
                 event_idx += 1
         
@@ -312,6 +346,11 @@ class GoogleClient:
                 logger.debug(f"  Master Event Details: UID={event.uid}, Recurrence={event_data.get('recurrence')}")
             elif event.recurrence_id:
                 logger.debug(f"  Exception Details: UID={event.uid}, RecurrenceID={event.recurrence_id}, recurringEventId={event_data.get('recurringEventId')}")
+                # DIAG: Exceptions should include originalStartTime to suppress the generated instance
+                if 'originalStartTime' not in event_data:
+                    logger.warning(f"[Google PUSH][DIAG] Batch update exception missing originalStartTime: UID={event.uid}, RecurrenceID={event.recurrence_id}, recurringEventId={event_data.get('recurringEventId')}")
+                else:
+                    logger.debug(f"[Google PUSH][DIAG] Batch update exception has originalStartTime: UID={event.uid}, RecurrenceID={event.recurrence_id}, originalStartTime={event_data.get('originalStartTime')}")
             body += "--batch_boundary\n"
             body += "Content-Type: application/http\n"
             body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
