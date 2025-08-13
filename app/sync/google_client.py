@@ -185,6 +185,8 @@ class GoogleClient:
         items = await self._list_events_paginated(params)
 
         events = {}
+        collisions = 0
+        resolved = 0
         for item in items:
             private_props = item.get('extendedProperties', {}).get('private', {})
             uid = private_props.get('caldav-mirror-uid')
@@ -193,8 +195,43 @@ class GoogleClient:
                 if model:
                     key = (uid, model.recurrence_id)
                     logger.debug(f"[Google KEY GEN] GID: {item.get('id')}, Key: {key}")
-                    events[key] = item
-        
+                    if key in events:
+                        collisions += 1
+                        existing = events[key]
+                        existing_status = (existing.get('status') or '').upper()
+                        candidate_status = (item.get('status') or '').upper()
+                        existing_has_recur = bool(existing.get('recurrence'))
+                        candidate_has_recur = bool(item.get('recurrence'))
+
+                        # Prefer non-cancelled over cancelled; otherwise prefer event declaring recurrence; otherwise keep existing
+                        prefer_candidate = False
+                        if existing_status == 'CANCELLED' and candidate_status != 'CANCELLED':
+                            prefer_candidate = True
+                        elif existing_status != 'CANCELLED' and candidate_status == 'CANCELLED':
+                            prefer_candidate = False
+                        else:
+                            if candidate_has_recur and not existing_has_recur:
+                                prefer_candidate = True
+                            elif not candidate_has_recur and existing_has_recur:
+                                prefer_candidate = False
+                            else:
+                                prefer_candidate = False
+
+                        chosen = item if prefer_candidate else existing
+                        dropped = existing if prefer_candidate else item
+                        logger.debug(
+                            f"[Google KEY COLLISION][RESOLVE] Key={key} "
+                            f"kept_id={chosen.get('id')} kept_status={(chosen.get('status') or '').upper()} "
+                            f"dropped_id={dropped.get('id')} dropped_status={(dropped.get('status') or '').upper()}"
+                        )
+                        events[key] = chosen
+                        resolved += 1
+                    else:
+                        events[key] = item
+
+        if collisions:
+            logger.debug(f"[Google KEY COLLISION][DIAG] Total collisions observed: {collisions}, resolved={resolved}")
+
         logger.info(f"Found {len(events)} mirrored events for source: {source_name}")
         return events
 

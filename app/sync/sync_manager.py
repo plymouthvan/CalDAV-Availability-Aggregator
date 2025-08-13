@@ -108,7 +108,8 @@ class SyncManager:
                             event.to_dict(),
                             event.compute_hash(),
                             event.is_master_event,
-                            google_event_id=google_event_id
+                            google_event_id=google_event_id,
+                            google_recurring_event_id=event.google_recurring_event_id
                         )
 
             # 4. Trigger the reconciliation process

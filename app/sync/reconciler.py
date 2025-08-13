@@ -161,13 +161,22 @@ class Reconciler:
                 master_model = desired_instances.get((uid, None)) or google_active_instances.get((uid, None))
                 if master_model and master_model.rrule:
                     is_recurring = True
-            
+
+            # DIAG: master presence and key counts for this UID
+            try:
+                master_active_present = (uid, None) in google_active_instances
+                g_master_all = google_instances_all.get((uid, None))
+                master_cancelled_present = bool(g_master_all and g_master_all.status == 'CANCELLED')
+                logger.debug(f"[SERIES DIAG][{source_name}] UID={uid} master_active={master_active_present}, master_cancelled={master_cancelled_present}, db_keys_count={len(db_series_keys)}, google_active_keys_count={len(google_series_keys)}")
+            except Exception:
+                logger.debug(f"[SERIES DIAG][{source_name}] UID={uid} diagnostics failed.")
+
             if not is_recurring:
                 continue # Skip to next UID, non-recurring events are handled later
 
             # If the set of instances is different, the whole series must be replaced.
             if db_series_keys != google_series_keys:
-                logger.info(f"[{source_name}] Series {uid} has a structural mismatch. DB keys: {db_series_keys}, Google keys: {google_series_keys}. Replacing.")
+                logger.info(f"[REPLACE][STRUCTURAL][{source_name}] UID={uid} structural mismatch. DB keys: {db_series_keys}, Google keys: {google_series_keys}.")
                 series_to_replace.add(uid)
                 continue
 
@@ -178,13 +187,13 @@ class Reconciler:
 
                 if not google_model:
                     # This case should be caught by the structural mismatch check, but as a safeguard:
-                    logger.warning(f"[{source_name}] Mismatch: DB key {key} not found in Google results for series {uid}. Replacing.")
+                    logger.info(f"[REPLACE][MISSING_KEY][{source_name}] UID={uid} DB key {key} not found in Google active results.")
                     series_to_replace.add(uid)
                     break
 
-                # Check for cancelled (deleted) instances on Google
+                # Check for cancelled (deleted) instances on Google (should not occur in active set)
                 if google_model.status == 'CANCELLED':
-                    logger.info(f"[{source_name}] Series {uid} has a cancelled instance on Google (GID: {google_model.google_event_id}). Replacing.")
+                    logger.info(f"[REPLACE][CANCELLED_ACTIVE][{source_name}] UID={uid} cancelled instance present in active set (GID: {google_model.google_event_id}).")
                     series_to_replace.add(uid)
                     break
 
@@ -196,7 +205,7 @@ class Reconciler:
                         db_model.google_recurring_event_id = master_gcal_event.google_event_id
 
                 if db_model.compute_hash() != google_model.compute_hash():
-                    logger.info(f"[{source_name}] Series {uid} has a content mismatch in instance {key}. Replacing.")
+                    logger.info(f"[REPLACE][CONTENT][{source_name}] UID={uid} content mismatch at {key}.")
                     series_to_replace.add(uid)
                     break # Move to the next UID
             
@@ -207,9 +216,15 @@ class Reconciler:
             # Only trigger replacement if the DB still has this series (avoid churn for fully-removed series).
             if db_series_keys:
                 google_series_events_all = [g for k, g in google_instances_all.items() if k[0] == uid]
+                try:
+                    cancelled_count = sum(1 for g in google_series_events_all if g and g.status == 'CANCELLED')
+                    active_count = sum(1 for g in google_series_events_all if g and g.status != 'CANCELLED')
+                    logger.debug(f"[SERIES DIAG][{source_name}] UID={uid} google_all_counts active={active_count} cancelled={cancelled_count}")
+                except Exception:
+                    cancelled_count = None
                 for g_event in google_series_events_all:
                     if g_event.status == 'CANCELLED':
-                        logger.info(f"[{source_name}] Series {uid} has a cancelled instance on Google (GID: {g_event.google_event_id}). Replacing.")
+                        logger.info(f"[REPLACE][TOMBSTONE_PRESENT][{source_name}] UID={uid} cancelled item present in Google (GID: {g_event.google_event_id}).")
                         series_to_replace.add(uid)
                         break
         

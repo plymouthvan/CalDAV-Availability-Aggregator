@@ -42,6 +42,7 @@ class Database:
                 caldav_uid TEXT NOT NULL,
                 recurrence_id TEXT, -- For exceptions, this is the original start time of the instance
                 google_event_id TEXT,
+                google_recurring_event_id TEXT, -- For exceptions, the master event's Google ID
                 event_hash TEXT NOT NULL,
                 event_data TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -83,7 +84,7 @@ class Database:
     
     async def store_event(self, source_name: str, caldav_uid: str, recurrence_id: Optional[str],
                           event_data: Dict[str, Any], event_hash: str, is_master_event: bool,
-                          google_event_id: Optional[str] = None) -> str:
+                          google_event_id: Optional[str] = None, google_recurring_event_id: Optional[str] = None) -> str:
         """Store or update an event instance (master or exception) in the database."""
         internal_id = str(uuid.uuid4())
 
@@ -95,10 +96,10 @@ class Database:
             where_params = (source_name, caldav_uid, recurrence_id) if recurrence_id is not None else (source_name, caldav_uid)
 
             # Try to update existing event first
-            update_params = (event_hash, json.dumps(event_data, default=str), google_event_id, is_master_event, *where_params)
+            update_params = (event_hash, json.dumps(event_data, default=str), google_event_id, google_recurring_event_id, is_master_event, *where_params)
             await db.execute(f"""
                 UPDATE events
-                SET event_hash = ?, event_data = ?, google_event_id = ?, is_master_event = ?,
+                SET event_hash = ?, event_data = ?, google_event_id = ?, google_recurring_event_id = ?, is_master_event = ?,
                     updated_at = CURRENT_TIMESTAMP, last_synced = CURRENT_TIMESTAMP
                 WHERE {where_clause}
             """, update_params)
@@ -106,11 +107,11 @@ class Database:
             if db.total_changes == 0:
                 # Insert new event
                 insert_params = (internal_id, source_name, caldav_uid, recurrence_id, event_hash,
-                                 json.dumps(event_data, default=str), google_event_id, is_master_event)
+                                 json.dumps(event_data, default=str), google_event_id, google_recurring_event_id, is_master_event)
                 await db.execute("""
                     INSERT INTO events (internal_id, source_name, caldav_uid, recurrence_id, event_hash,
-                                      event_data, google_event_id, is_master_event, last_synced)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                      event_data, google_event_id, google_recurring_event_id, is_master_event, last_synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """, insert_params)
             else:
                 # Get the existing internal_id
