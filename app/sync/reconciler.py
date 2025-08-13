@@ -109,11 +109,17 @@ class Reconciler:
         for key, event in desired_instances.items():
             logger.debug(f"[KEY GEN] Source Event Key: UID={event.uid}, RecurrenceID={event.recurrence_id}")
 
-        google_instances = {
+        # Build full set including cancelled (tombstones)
+        google_instances_all = {
             key: EventModel.from_google_event(val)
             for key, val in google_events_raw.items()
         }
-        for key, event in google_instances.items():
+        # Active (non-cancelled) set used for structural comparison and deletion
+        google_active_instances = {
+            key: event for key, event in google_instances_all.items()
+            if event and event.status != 'CANCELLED'
+        }
+        for key, event in google_active_instances.items():
             logger.debug(f"[KEY GEN] Google Event Key: UID={event.uid}, RecurrenceID={event.recurrence_id}")
 
         # --- RID Validation Diagnostics ---
@@ -135,163 +141,124 @@ class Reconciler:
             logger.warning(f"[RID VALIDATION] Unexpected error while validating: {e}")
 
         db_keys = set(desired_instances.keys())
-        google_keys = set(google_instances.keys())
+        # Only consider active Google items for structural keys
+        google_keys = set(google_active_instances.keys())
 
         logger.debug(f"[{source_name}] DB keys ({len(db_keys)}): {db_keys}")
         logger.debug(f"[{source_name}] Google keys ({len(google_keys)}): {google_keys}")
 
-        to_create_keys = db_keys - google_keys
-        to_delete_keys = google_keys - db_keys
-        to_compare_keys = db_keys.intersection(google_keys)
+        # --- Series-level Reconciliation ---
+        series_to_replace = set()
+        all_uids = {key[0] for key in db_keys | google_keys}
 
-        logger.debug(f"[{source_name}] Keys to create: {to_create_keys}")
-        logger.debug(f"[{source_name}] Keys to delete: {to_delete_keys}")
-        logger.debug(f"[{source_name}] Keys to compare: {to_compare_keys}")
+        for uid in all_uids:
+            db_series_keys = {k for k in db_keys if k[0] == uid}
+            google_series_keys = {k for k in google_keys if k[0] == uid}
 
+            # A series is recurring if it has exceptions or if its master event has an RRULE.
+            is_recurring = any(k[1] is not None for k in db_series_keys | google_series_keys)
+            if not is_recurring:
+                master_model = desired_instances.get((uid, None)) or google_active_instances.get((uid, None))
+                if master_model and master_model.rrule:
+                    is_recurring = True
+            
+            if not is_recurring:
+                continue # Skip to next UID, non-recurring events are handled later
+
+            # If the set of instances is different, the whole series must be replaced.
+            if db_series_keys != google_series_keys:
+                logger.info(f"[{source_name}] Series {uid} has a structural mismatch. DB keys: {db_series_keys}, Google keys: {google_series_keys}. Replacing.")
+                series_to_replace.add(uid)
+                continue
+
+            # If the structure is the same, check for content changes or cancellations.
+            for key in db_series_keys:
+                db_model = desired_instances[key]
+                google_model = google_active_instances.get(key)
+
+                if not google_model:
+                    # This case should be caught by the structural mismatch check, but as a safeguard:
+                    logger.warning(f"[{source_name}] Mismatch: DB key {key} not found in Google results for series {uid}. Replacing.")
+                    series_to_replace.add(uid)
+                    break
+
+                # Check for cancelled (deleted) instances on Google
+                if google_model.status == 'CANCELLED':
+                    logger.info(f"[{source_name}] Series {uid} has a cancelled instance on Google (GID: {google_model.google_event_id}). Replacing.")
+                    series_to_replace.add(uid)
+                    break
+
+                # Ensure desired exceptions carry the master recurringEventId BEFORE hashing
+                if db_model.recurrence_id and not db_model.google_recurring_event_id:
+                    master_key = (db_model.uid, None)
+                    master_gcal_event = google_active_instances.get(master_key)
+                    if master_gcal_event and master_gcal_event.google_event_id:
+                        db_model.google_recurring_event_id = master_gcal_event.google_event_id
+
+                if db_model.compute_hash() != google_model.compute_hash():
+                    logger.info(f"[{source_name}] Series {uid} has a content mismatch in instance {key}. Replacing.")
+                    series_to_replace.add(uid)
+                    break # Move to the next UID
+            
+            if uid in series_to_replace:
+                continue
+
+            # Also check for any cancelled events in Google for this series (use full map).
+            # Only trigger replacement if the DB still has this series (avoid churn for fully-removed series).
+            if db_series_keys:
+                google_series_events_all = [g for k, g in google_instances_all.items() if k[0] == uid]
+                for g_event in google_series_events_all:
+                    if g_event.status == 'CANCELLED':
+                        logger.info(f"[{source_name}] Series {uid} has a cancelled instance on Google (GID: {g_event.google_event_id}). Replacing.")
+                        series_to_replace.add(uid)
+                        break
+        
+        # --- Build Plan ---
         to_create: List[EventModel] = []
         to_update: List[Tuple[str, EventModel]] = []
         to_delete: List[str] = []
 
-        # Events to create
-        for key in to_create_keys:
-            model = desired_instances[key]
-            if model.recurrence_id:
-                master_key = (model.uid, None)
-                master_gcal_event = google_instances.get(master_key)
-                if master_gcal_event and master_gcal_event.google_event_id:
-                    model.google_recurring_event_id = master_gcal_event.google_event_id
-                else:
-                    logger.warning(f"[{source_name}] Cannot create exception {key} because its master is not in Google yet.")
-                    continue
-            to_create.append(model)
+        # Plan replacement for entire series
+        for uid in series_to_replace:
+            # For recurring series replacement: delete ONLY master(s). Deleting masters will cancel instances,
+            # and deleting instances alongside masters in the same batch can cause 409 conflicts.
+            google_masters_in_series = [
+                g for (k, g) in google_active_instances.items()
+                if k[0] == uid and k[1] is None
+            ]
+            for g_event in google_masters_in_series:
+                if g_event.google_event_id:
+                    to_delete.append(g_event.google_event_id)
 
-        # Events to delete
-        for key in to_delete_keys:
-            google_model = google_instances[key]
-            if google_model.google_event_id:
-                to_delete.append(google_model.google_event_id)
+            # Add all desired DB events for this UID to the create list
+            db_events_in_series = [d for k, d in desired_instances.items() if k[0] == uid]
+            to_create.extend(db_events_in_series)
 
-        # Events to update
-        for key in to_compare_keys:
+        # Handle non-recurring events that are not part of a series being replaced
+        non_recurring_db_keys = {k for k in db_keys if k[0] not in series_to_replace}
+        non_recurring_google_keys = {k for k in google_keys if k[0] not in series_to_replace}
+
+        nr_to_create_keys = non_recurring_db_keys - non_recurring_google_keys
+        nr_to_delete_keys = non_recurring_google_keys - non_recurring_db_keys
+        nr_to_compare_keys = non_recurring_db_keys.intersection(non_recurring_google_keys)
+
+        for key in nr_to_create_keys:
+            to_create.append(desired_instances[key])
+        
+        for key in nr_to_delete_keys:
+            if google_active_instances[key].google_event_id:
+                to_delete.append(google_active_instances[key].google_event_id)
+
+        for key in nr_to_compare_keys:
             db_model = desired_instances[key]
-            google_model = google_instances[key]
-
-            # If desired is an exception but the Google event is standalone (no recurringEventId),
-            # replace via delete-and-create so the new exception is anchored by originalStartTime.
-            if db_model.recurrence_id and not google_model.google_recurring_event_id:
-                master_key = (db_model.uid, None)
-                master_gcal_event = google_instances.get(master_key)
-                if master_gcal_event and master_gcal_event.google_event_id:
-                    new_event = EventModel.from_dict(db_model.to_dict())
-                    new_event.google_event_id = None
-                    new_event.google_recurring_event_id = master_gcal_event.google_event_id
-                    to_delete.append(google_model.google_event_id)
-                    to_create.append(new_event)
-                    logger.info(
-                        f"[{source_name}] Converting standalone exception to linked exception. "
-                        f"UID: {db_model.uid}, RecurrenceID: {db_model.recurrence_id}. "
-                        f"Delete GID: {google_model.google_event_id} then create linked exception under master {master_gcal_event.google_event_id}."
-                    )
-                    continue
-                else:
-                    logger.warning(f"[{source_name}] Cannot convert exception {key} because master is not present in Google.")
-
-            # Ensure desired exceptions carry the master recurringEventId BEFORE hashing
-            if db_model.recurrence_id and not db_model.google_recurring_event_id:
-                master_key = (db_model.uid, None)
-                master_gcal_event = google_instances.get(master_key)
-                if master_gcal_event and master_gcal_event.google_event_id:
-                    db_model.google_recurring_event_id = master_gcal_event.google_event_id
-
-            db_hash = db_model.compute_hash()
-            google_hash = google_model.compute_hash()
-
-            if db_hash != google_hash:
+            google_model = google_active_instances[key]
+            if db_model.compute_hash() != google_model.compute_hash():
                 logger.info(
-                    f"[{source_name}] Change detected for event. "
-                    f"UID: {db_model.uid}, RecurrenceID: {db_model.recurrence_id}. "
-                    f"Google Event ID: {google_model.google_event_id}. "
-                    f"Old Hash: {google_hash}\nNew Hash: {db_hash}."
+                    f"[{source_name}] Change detected for non-recurring event. "
+                    f"UID: {db_model.uid}. Google Event ID: {google_model.google_event_id}."
                 )
                 db_model.google_event_id = google_model.google_event_id
-                if db_model.recurrence_id and not db_model.google_recurring_event_id:
-                    master_key = (db_model.uid, None)
-                    master_gcal_event = google_instances.get(master_key)
-                    if master_gcal_event:
-                        db_model.google_recurring_event_id = master_gcal_event.google_event_id
                 to_update.append((db_model.google_event_id, db_model))
-
-        # --- Orphan Sweep Step ---
-        all_uids = {key[0] for key in db_keys | google_keys}
-        orphans_to_delete_gids = set()
-        orphans_to_delete_keys = set()
-
-        for uid in all_uids:
-            # 1. Build source and google exception sets for the current UID
-            source_master = desired_instances.get((uid, None))
-            source_exdates = {exdate.strftime('%Y%m%d') for exdate in source_master.exdates} if source_master and source_master.exdates else set()
-            
-            source_exceptions = {
-                key[1] for key in db_keys if key[0] == uid and key[1] is not None
-            }
-            
-            google_exceptions = [
-                g_event for g_key, g_event in google_instances.items()
-                if g_key[0] == uid and g_event.recurrence_id is not None
-            ]
-
-            # 2. Compute delete candidates
-            delete_candidates = []
-
-            for g_event in google_exceptions:
-                rid = g_event.recurrence_id
-                rid_date_str = ""
-                if rid:
-                    try:
-                        # Normalize recurrence ID to YYYYMMDD format for comparison with EXDATEs
-                        rid_dt = datetime.strptime(rid, '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc)
-                        rid_date_str = rid_dt.strftime('%Y%m%d')
-                    except (ValueError, TypeError):
-                        try:
-                            rid_dt = datetime.strptime(rid, '%Y%m%d').replace(tzinfo=timezone.utc)
-                            rid_date_str = rid_dt.strftime('%Y%m%d')
-                        except (ValueError, TypeError):
-                             logger.warning(f"[{source_name}] Could not parse recurrence_id '{rid}' for UID {uid}")
-                             continue
-
-                # A: exceptions where rid is in source_exdates
-                if rid_date_str and rid_date_str in source_exdates:
-                    delete_candidates.append((g_event, "EXDATE found in source master"))
-                    continue
-
-                # B: exceptions where rid is not in source_exceptions
-                if rid not in source_exceptions:
-                    delete_candidates.append((g_event, "Recurrence ID not found in source exceptions"))
-                    continue
-            
-            # C: Tagged, standalone Google events with our extProps
-            standalone_google_events = [
-                g_event for g_key, g_event in google_instances.items()
-                if g_key[0] == uid and g_event.google_recurring_event_id is None and g_event.recurrence_id is not None
-            ]
-            for g_event in standalone_google_events:
-                 if g_event.recurrence_id not in source_exceptions:
-                    delete_candidates.append((g_event, "Standalone Google event not in source exceptions"))
-
-            # 3. Log and prepare for deletion
-            if delete_candidates:
-                plan_log = f"[{source_name}] [ORPHAN_DELETE_PLAN] UID: {uid}\n"
-                for g_event, reason in delete_candidates:
-                    plan_log += f"  - Deleting GID: {g_event.google_event_id}, RID: {g_event.recurrence_id}. Reason: {reason}\n"
-                    orphans_to_delete_gids.add(g_event.google_event_id)
-                    orphans_to_delete_keys.add((uid, g_event.recurrence_id))
-                logger.info(plan_log)
-
-        if orphans_to_delete_gids:
-            to_delete.extend(list(orphans_to_delete_gids))
-            # We also need to ensure these are removed from the DB tracking.
-            # This assumes the main deletion logic will handle DB removal.
-            # If not, we would call: await self.db.bulk_delete_events(source_name, orphans_to_delete_keys)
 
         # --- Ordered execution to avoid invalid exception creations ---
         # Treat all non-exception events (masters and non-recurring) as "primary"
@@ -310,6 +277,36 @@ class Reconciler:
             f"primary_update={len(primary_to_update)}, exceptions_update={len(exceptions_to_update)})"
         )
 
+        # Ensure created_map always exists for downstream exception creation
+        created_map: Dict[Tuple[str, Optional[str]], str] = {}
+        if exceptions_to_create:
+            # After primary events are created, their Google IDs are available in the created_map.
+            # We must now set the `google_recurring_event_id` on our exception models before creating them.
+            newly_created_masters = {k: v for k, v in created_map.items() if k[1] is None}
+            
+            valid_exceptions_to_create = []
+            for exception_model in exceptions_to_create:
+                master_key = (exception_model.uid, None)
+                master_id = newly_created_masters.get(master_key)
+
+                if not master_id:
+                    # This can happen if the master already existed and was not part of this create batch.
+                    # We need to find its ID from the original google_active_instances map.
+                    master_gcal_event = google_active_instances.get(master_key)
+                    if master_gcal_event and master_gcal_event.google_event_id:
+                         master_id = master_gcal_event.google_event_id
+
+                if master_id:
+                    exception_model.google_recurring_event_id = master_id
+                    valid_exceptions_to_create.append(exception_model)
+                else:
+                    logger.error(f"[{source_name}] CRITICAL: Cannot find master Google ID for exception {exception_model.uid}/{exception_model.recurrence_id}. Skipping creation.")
+
+            if valid_exceptions_to_create:
+                created_map_exceptions = await self.google.batch_create_events(valid_exceptions_to_create)
+                if created_map_exceptions:
+                    await self.db.bulk_update_google_ids(source_name, created_map_exceptions)
+
         # 1) Update primary (masters and non-recurring) first
         if primary_to_update:
             await self.google.batch_update_events(primary_to_update)
@@ -326,9 +323,32 @@ class Reconciler:
 
         # 4) Create exceptions after primary are settled
         if exceptions_to_create:
-            created_map = await self.google.batch_create_events(exceptions_to_create)
-            if created_map:
-                await self.db.bulk_update_google_ids(source_name, created_map)
+            # After primary events are created, their Google IDs are available in the created_map.
+            # We must now set the `google_recurring_event_id` on our exception models before creating them.
+            newly_created_masters = {k: v for k, v in created_map.items() if k[1] is None}
+            
+            valid_exceptions_to_create = []
+            for exception_model in exceptions_to_create:
+                master_key = (exception_model.uid, None)
+                master_id = newly_created_masters.get(master_key)
+
+                if not master_id:
+                    # This can happen if the master already existed and was not part of this create batch.
+                    # We need to find its ID from the original google_instances map.
+                    master_gcal_event = google_active_instances.get(master_key)
+                    if master_gcal_event and master_gcal_event.google_event_id:
+                         master_id = master_gcal_event.google_event_id
+
+                if master_id:
+                    exception_model.google_recurring_event_id = master_id
+                    valid_exceptions_to_create.append(exception_model)
+                else:
+                    logger.error(f"[{source_name}] CRITICAL: Cannot find master Google ID for exception {exception_model.uid}/{exception_model.recurrence_id}. Skipping creation.")
+
+            if valid_exceptions_to_create:
+                created_map_exceptions = await self.google.batch_create_events(valid_exceptions_to_create)
+                if created_map_exceptions:
+                    await self.db.bulk_update_google_ids(source_name, created_map_exceptions)
 
         # 5) Delete orphans last
         if to_delete_dedup:

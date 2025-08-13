@@ -122,6 +122,7 @@ class GoogleClient:
                     
                     # Filter out None values from params before the request
                     request_params = {k: v for k, v in params.items() if v is not None}
+                    request_params['showDeleted'] = "true" # Ensure we see cancelled instances
                     
                     logger.debug(f"Requesting events with params: {request_params}")
                     async with session.get(url, headers=headers, params=request_params) as response:
@@ -137,17 +138,15 @@ class GoogleClient:
                                 logger.debug(
                                     f"[RAW GOOGLE EVENT] ID: {item.get('id')}, "
                                     f"Summary: {item.get('summary')}, "
+                                    f"Status: {item.get('status')}, "
                                     f"Start: {item.get('start', {}).get('dateTime')}, "
                                     f"OriginalStart: {item.get('originalStartTime')}, "
                                     f"ExtendedProps: {item.get('extendedProperties')}"
                                 )
 
-                        active_items = [item for item in items if item.get('status') != 'cancelled']
-                        
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(f"Received page with {len(items)} items, {len(active_items)} active.")
+                        logger.debug(f"Received page with {len(items)} items.")
 
-                        all_items.extend(active_items)
+                        all_items.extend(items)
                         page_token = data.get('nextPageToken')
                         if not page_token:
                             break
@@ -180,7 +179,8 @@ class GoogleClient:
         logger.info(f"Listing all mirrored events for source: {source_name}")
         params = {
             'privateExtendedProperty': f"caldav-mirror-source={source_name}",
-            'maxResults': 2500
+            'maxResults': 2500,
+            'showDeleted': "true"
         }
         items = await self._list_events_paginated(params)
 
@@ -205,7 +205,7 @@ class GoogleClient:
         page_token = None
         url = f"{self.API_BASE_URL}/calendars/{self.calendar_id}/events/{google_event_id}/instances"
         headers = await self._get_auth_headers()
-        params = {'maxResults': 2500}
+        params = {'maxResults': 2500, 'showDeleted': "true"}
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -219,12 +219,10 @@ class GoogleClient:
                             break
                         data = await response.json()
                         items = data.get('items', [])
-                        active_items = [item for item in items if item.get('status') != 'cancelled']
-                        
                         if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(f"Received page with {len(items)} items, {len(active_items)} active.")
+                            logger.debug(f"Received page with {len(items)} items.")
                         
-                        instances.extend(active_items)
+                        instances.extend(items)
                         page_token = data.get('nextPageToken')
                         if not page_token:
                             break
