@@ -95,8 +95,8 @@ class GoogleClient:
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.delete(url, headers=headers) as response:
-                    if response.status in [204, 410]: # 204 No Content, 410 Gone
+                async with session.delete(url, headers=headers, params={'sendUpdates': 'none'}) as response:
+                    if response.status in [204, 404, 410]: # 204 No Content, 404 Not Found, 410 Gone
                         logger.info(f"Successfully deleted Google event ID: {google_event_id}")
                         return True
                     else:
@@ -122,7 +122,9 @@ class GoogleClient:
                     
                     # Filter out None values from params before the request
                     request_params = {k: v for k, v in params.items() if v is not None}
-                    request_params['showDeleted'] = "true" # Ensure we see cancelled instances
+                    # Default to only active events unless explicitly requested
+                    if 'showDeleted' not in request_params:
+                        request_params['showDeleted'] = "false"
                     
                     logger.debug(f"Requesting events with params: {request_params}")
                     async with session.get(url, headers=headers, params=request_params) as response:
@@ -174,9 +176,75 @@ class GoogleClient:
         logger.info(f"Found {len(events)} mirrored master events for source: {source_name}")
         return events
 
-    async def list_all_mirrored_events(self, source_name: str) -> Dict[Tuple[str, Optional[str]], Dict[str, Any]]:
-        """Fetches all mirrored events (masters and instances) from Google Calendar."""
+    async def list_all_mirrored_events(self, source_name: str) -> Tuple[Dict[Tuple[str, Optional[str]], Dict[str, Any]], Dict[Tuple[str, Optional[str]], Dict[str, Any]]]:
+        """
+        Fetch mirrored events for a source.
+        Pure disown-before-delete model: only consider ACTIVE events and ignore CANCELLED tombstones.
+        Returns (active_events, {}) for backward compatibility with call sites.
+        """
         logger.info(f"Listing all mirrored events for source: {source_name}")
+        params = {
+            'privateExtendedProperty': f"caldav-mirror-source={source_name}",
+            'maxResults': 2500
+        }
+        items = await self._list_events_paginated(params)
+
+        active_events = {}
+        collisions = 0
+        resolved = 0
+
+        for item in items:
+            private_props = item.get('extendedProperties', {}).get('private', {})
+            uid = private_props.get('caldav-mirror-uid')
+            if not uid:
+                continue
+
+            status = (item.get('status') or '').upper()
+            if status == 'CANCELLED':
+                # Ignore tombstones entirely
+                continue
+
+            model = EventModel.from_google_event(item)
+            if not model:
+                continue
+
+            key = (uid, model.recurrence_id)
+
+            logger.debug(f"[Google KEY GEN] GID: {item.get('id')}, Key: {key}, Status: {status}")
+
+            if key in active_events:
+                collisions += 1
+                existing = active_events[key]
+                existing_has_recur = bool(existing.get('recurrence'))
+                candidate_has_recur = bool(item.get('recurrence'))
+
+                # Prefer the candidate that declares recurrence if conflict
+                prefer_candidate = candidate_has_recur and not existing_has_recur
+                chosen = item if prefer_candidate else existing
+                dropped = existing if prefer_candidate else item
+                logger.debug(
+                    f"[Google KEY COLLISION][RESOLVE] Key={key} "
+                    f"kept_id={chosen.get('id')} "
+                    f"dropped_id={dropped.get('id')}"
+                )
+                active_events[key] = chosen
+                resolved += 1
+            else:
+                active_events[key] = item
+
+        if collisions:
+            logger.debug(f"[Google KEY COLLISION][DIAG] Total collisions observed: {collisions}, resolved={resolved}")
+
+        logger.info(f"Found {len(active_events)} active mirrored events for source: {source_name}")
+        return active_events, {}
+
+    async def list_cancelled_by_source(self, source_name: str) -> Dict[Tuple[str, Optional[str]], Dict[str, Any]]:
+        """
+        Return CANCELLED Google events for a source, keyed by (uid, recurrence_id).
+        Used only to detect unauthorized deletions or edits on Google so we can
+        trigger a disown->delete->recreate flow for the affected series.
+        """
+        logger.info(f"Listing CANCELLED events for source: {source_name}")
         params = {
             'privateExtendedProperty': f"caldav-mirror-source={source_name}",
             'maxResults': 2500,
@@ -184,56 +252,85 @@ class GoogleClient:
         }
         items = await self._list_events_paginated(params)
 
-        events = {}
-        collisions = 0
-        resolved = 0
+        cancelled: Dict[Tuple[str, Optional[str]], Dict[str, Any]] = {}
         for item in items:
+            status = (item.get('status') or '').upper()
+            if status != 'CANCELLED':
+                continue
             private_props = item.get('extendedProperties', {}).get('private', {})
             uid = private_props.get('caldav-mirror-uid')
-            if uid:
-                model = EventModel.from_google_event(item)
-                if model:
-                    key = (uid, model.recurrence_id)
-                    logger.debug(f"[Google KEY GEN] GID: {item.get('id')}, Key: {key}")
-                    if key in events:
-                        collisions += 1
-                        existing = events[key]
-                        existing_status = (existing.get('status') or '').upper()
-                        candidate_status = (item.get('status') or '').upper()
-                        existing_has_recur = bool(existing.get('recurrence'))
-                        candidate_has_recur = bool(item.get('recurrence'))
+            if not uid:
+                continue
 
-                        # Prefer non-cancelled over cancelled; otherwise prefer event declaring recurrence; otherwise keep existing
-                        prefer_candidate = False
-                        if existing_status == 'CANCELLED' and candidate_status != 'CANCELLED':
-                            prefer_candidate = True
-                        elif existing_status != 'CANCELLED' and candidate_status == 'CANCELLED':
-                            prefer_candidate = False
-                        else:
-                            if candidate_has_recur and not existing_has_recur:
-                                prefer_candidate = True
-                            elif not candidate_has_recur and existing_has_recur:
-                                prefer_candidate = False
-                            else:
-                                prefer_candidate = False
+            model = EventModel.from_google_event(item)
+            if not model:
+                continue
 
-                        chosen = item if prefer_candidate else existing
-                        dropped = existing if prefer_candidate else item
-                        logger.debug(
-                            f"[Google KEY COLLISION][RESOLVE] Key={key} "
-                            f"kept_id={chosen.get('id')} kept_status={(chosen.get('status') or '').upper()} "
-                            f"dropped_id={dropped.get('id')} dropped_status={(dropped.get('status') or '').upper()}"
-                        )
-                        events[key] = chosen
-                        resolved += 1
+            key = (uid, model.recurrence_id)
+            cancelled[key] = item
+
+        logger.info(f"Found {len(cancelled)} CANCELLED events for source: {source_name}")
+        return cancelled
+
+    async def list_events_for_uid(self, source_name: str, uid: str, include_cancelled: bool = False) -> List[Dict[str, Any]]:
+        """
+        List Google Calendar events for a specific source + CalDAV UID.
+
+        Args:
+            include_cancelled: When True, include CANCELLED items (for detection/disown). Default False returns active only.
+        """
+        logger.info(f"Listing events for source '{source_name}', UID={uid}")
+        params = {
+            'privateExtendedProperty': [f"caldav-mirror-source={source_name}", f"caldav-mirror-uid={uid}"],
+            'maxResults': 2500,
+            'showDeleted': "true" if include_cancelled else None
+        }
+        items = await self._list_events_paginated(params)
+        return items
+
+    async def purge_tombstone(self, google_event_id: str) -> bool:
+        """
+        Deprecated: Tombstone handling has been removed in the pure disown-before-delete model.
+        This stub remains for compatibility and no-ops successfully.
+        """
+        logger.debug(f"purge_tombstone({google_event_id}) called, but tombstone handling is disabled.")
+        return True
+
+    async def disown_event(self, google_event_id: str) -> bool:
+        """
+        Disown a Google event by clearing CalDAV Mirror extendedProperties, so any subsequent
+        CANCELLED tombstones created by deletion won't be matched by our privateExtendedProperty filter.
+        """
+        logger.info(f"Disowning Google event ID: {google_event_id}")
+        url = f"{self.API_BASE_URL}/calendars/{self.calendar_id}/events/{google_event_id}"
+        headers = await self._get_auth_headers()
+        headers["Content-Type"] = "application/json"
+
+        payload = {
+            # Replace the private map with an empty dict to remove 'caldav-mirror-*' keys
+            "extendedProperties": {
+                "private": {}
+            }
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                # PATCH so we don't need to send the full event body
+                async with session.patch(url, headers=headers, json=payload) as response:
+                    if response.status == 200:
+                        logger.info(f"Successfully disowned Google event ID: {google_event_id}")
+                        return True
+                    elif response.status in [404, 410]:
+                        # Already gone; treat as disowned
+                        logger.info(f"Event {google_event_id} not found while disowning; treating as already disowned.")
+                        return True
                     else:
-                        events[key] = item
-
-        if collisions:
-            logger.debug(f"[Google KEY COLLISION][DIAG] Total collisions observed: {collisions}, resolved={resolved}")
-
-        logger.info(f"Found {len(events)} mirrored events for source: {source_name}")
-        return events
+                        error_text = await response.text()
+                        logger.error(f"Failed to disown Google event: {response.status} - {error_text}")
+                        return False
+        except Exception as e:
+            logger.error(f"Error disowning Google event: {e}", exc_info=True)
+            return False
 
     async def get_event_instances(self, google_event_id: str) -> List[Dict[str, Any]]:
         """Fetches all instances for a given recurring event ID."""
@@ -420,7 +517,7 @@ class GoogleClient:
             body += "--batch_boundary\n"
             body += "Content-Type: application/http\n"
             body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
-            body += f"DELETE /calendar/v3/calendars/{self.calendar_id}/events/{google_event_id}\n"
+            body += f"DELETE /calendar/v3/calendars/{self.calendar_id}/events/{google_event_id}?sendUpdates=none\n"
         body += "--batch_boundary--"
 
         try:

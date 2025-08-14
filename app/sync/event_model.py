@@ -403,15 +403,45 @@ class EventModel:
         }
         return status_map.get(caldav_status, 'needsAction')
     
-    def compute_hash(self) -> str:
+    def normalized_for_hash(self) -> Dict[str, Any]:
         """
-        Compute a hash of the event for deduplication.
-        
-        Returns:
-            SHA-256 hash of normalized event data
+        Return the normalized dictionary that is hashed for reconciliation.
+        Useful for diagnostics to understand why hashes differ across DB vs Google.
         """
-        # Create a normalized representation for hashing
-        hash_data = {
+        # Canonicalize RRULE to avoid churn from harmless Google-added defaults (e.g., WKST, INTERVAL=1)
+        def _canon_rrule(rrule_str: Optional[str]) -> Optional[str]:
+            if not rrule_str:
+                return None
+            try:
+                parts = [p for p in rrule_str.split(';') if p]
+                kv = {}
+                for p in parts:
+                    if '=' not in p:
+                        continue
+                    k, v = p.split('=', 1)
+                    k = k.strip().upper()
+                    v = v.strip().upper()
+                    # Drop benign/default noise that Google may inject
+                    if k == 'WKST':
+                        continue
+                    if k == 'INTERVAL' and v == '1':
+                        continue
+                    # Normalize list ordering for stable comparison
+                    if k in ('BYDAY','BYMONTH','BYMONTHDAY','BYHOUR','BYMINUTE','BYSECOND','BYSETPOS','BYYEARDAY','BYWEEKNO'):
+                        v = ','.join(sorted([x.strip() for x in v.split(',') if x.strip()]))
+                    kv[k] = v
+                # Ensure FREQ appears first, then keys sorted alphabetically
+                items = []
+                if 'FREQ' in kv:
+                    items.append(f"FREQ={kv.pop('FREQ')}")
+                for k in sorted(kv.keys()):
+                    items.append(f"{k}={kv[k]}")
+                return ';'.join(items)
+            except Exception:
+                # Fallback to original if parsing fails
+                return rrule_str
+
+        return {
             'uid': self.uid,
             'summary': self.summary,
             'description': self.description,
@@ -419,10 +449,8 @@ class EventModel:
             'end_datetime': self.end_datetime.isoformat() if self.end_datetime else None,
             'start_date': self.start_date,
             'end_date': self.end_date,
-            'timezone': self.timezone,
             'location': self.location,
-
-            'rrule': self.rrule,
+            'rrule': _canon_rrule(self.rrule),
             'recurrence_id': self.recurrence_id,
             'exdates': sorted([dt.isoformat() for dt in self.exdates]) if self.exdates else [],
             'is_master_event': self.is_master_event,
@@ -431,14 +459,15 @@ class EventModel:
             'classification': self.classification,
             'source_name': self.source_name
         }
-        
-        # Convert to JSON string with sorted keys for consistent hashing
-        json_str = json.dumps(hash_data, sort_keys=True, default=str)
-        
-        # Return SHA-256 hash
-        hash_val = hashlib.sha256(json_str.encode('utf-8')).hexdigest()
 
-
+    def compute_hash(self) -> str:
+        """
+        Compute a hash of the event for deduplication.
+        
+        Returns:
+            SHA-256 hash of normalized event data
+        """
+        json_str = json.dumps(self.normalized_for_hash(), sort_keys=True, default=str)
         return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
     
     def to_dict(self) -> Dict[str, Any]:

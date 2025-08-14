@@ -56,13 +56,50 @@ class iCloudCalDAVClient(BaseCalDAVClient):
                     new_ctag = await self._get_ctag()
                     new_sync_state = {"ctag": new_ctag} if new_ctag else None
 
-                    # Filter out unchanged events
+                    # Group by UID and include the entire series when any item in that series
+                    # changed OR any previously-stored instance disappeared (e.g., exception removed).
                     new_and_updated_events = []
                     if self.database:
                         stored_events = await self.database.get_all_events_for_source(self.name)
-                        for event in all_events:
-                            if event.uid not in stored_events or event.compute_hash() != stored_events[event.uid]['event_hash']:
-                                new_and_updated_events.append(event)
+
+                        # Build current snapshot grouped by UID
+                        events_by_uid = {}
+                        for ev in all_events:
+                            events_by_uid.setdefault(ev.uid, []).append(ev)
+
+                        # Helper: build stored recurrence-id sets per UID from DB snapshot
+                        stored_rids_by_uid = {}
+                        try:
+                            for (s_uid, s_rid) in stored_events.keys():
+                                stored_rids_by_uid.setdefault(s_uid, set()).add(s_rid)
+                        except Exception:
+                            # If stored_events is not a dict-like with .keys(), fallback defensively
+                            stored_rids_by_uid = {}
+
+                        for uid, series_events in events_by_uid.items():
+                            # Compute change detection
+                            changed = False
+
+                            # 1) Any new/modified instances?
+                            for ev in series_events:
+                                stored = stored_events.get((uid, ev.recurrence_id))
+                                if not stored or ev.compute_hash() != stored.get('event_hash'):
+                                    changed = True
+                                    break
+
+                            # 2) Any previously stored instances now missing (exception deletion)?
+                            if not changed:
+                                current_rids = {ev.recurrence_id for ev in series_events}
+                                stored_rids = stored_rids_by_uid.get(uid, set())
+                                removed_rids = stored_rids - current_rids
+                                if removed_rids:
+                                    changed = True
+
+                            if changed:
+                                # Push the full, current series for this UID so downstream storage
+                                # can "clear-and-replace" without losing masters.
+                                new_and_updated_events.extend(series_events)
+                                logger.debug(f"[{self.name}] Series {uid} changed; including {len(series_events)} events")
                     else:
                         new_and_updated_events = all_events
 
