@@ -68,12 +68,12 @@ def load_configuration() -> Dict[str, Any]:
 
 async def main():
     """Main entry point for the CalDAV Mirror service."""
-    logger = setup_logger(level="DEBUG")
+    logger = setup_logger(level="INFO")
     logger.info("Starting CalDAV Mirror service...")
 
-    logging.getLogger("app.sync.event_model").setLevel(logging.DEBUG)
+    logging.getLogger("app.sync.event_model").setLevel(logging.INFO)
     logging.getLogger("app.sync.reconciler").setLevel(logging.INFO)
-    logging.getLogger("app.sync.google_client").setLevel(logging.DEBUG)
+    logging.getLogger("app.sync.google_client").setLevel(logging.INFO)
     logging.getLogger("aiosqlite").setLevel(logging.INFO)
 
     try:

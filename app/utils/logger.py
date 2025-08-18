@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 
-def setup_logger(name: Optional[str] = None, level: str = "DEBUG",
+def setup_logger(name: Optional[str] = None, level: str = "INFO",
                 log_file: Optional[str] = None) -> logging.Logger:
     """
     Set up structured logging for the CalDAV Mirror service.

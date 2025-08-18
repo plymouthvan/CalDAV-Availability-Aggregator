@@ -496,7 +496,8 @@ class GoogleClient:
                 async with session.post(batch_url, data=body.encode('utf-8'), headers=headers) as response:
                     response_text = await response.text()
                     if response.status == 200:
-                        logger.info(f"Batch update successful. Response: {response_text}")
+                        logger.info(f"Batch update successful.")
+                        logger.debug(f"Response: {response_text}")
                         return True
                     else:
                         logger.error(f"Batch update failed: {response.status} - {response_text}")
@@ -525,7 +526,8 @@ class GoogleClient:
                 async with session.post(batch_url, data=body.encode('utf-8'), headers=headers) as response:
                     response_text = await response.text()
                     if response.status == 200:
-                        logger.info(f"Batch delete successful. Response: {response_text}")
+                        logger.info(f"Batch delete successful.")
+                        logger.debug(f"Response: {response_text}")
                         return True
                     else:
                         logger.error(f"Batch delete failed: {response.status} - {response_text}")

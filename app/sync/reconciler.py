@@ -370,26 +370,29 @@ class Reconciler:
         # Disown-then-delete recurring series masters (no tombstone handling)
         for uid, google_ids in recurring_series_to_delete.items():
             masters_ids = recurring_series_to_delete[uid].get('masters', [])
-
-            # Disown all active items for this UID (master + exceptions) so any later trash tombstones
-            # won't match our privateExtendedProperty filter.
+            
+            # Disown only ACTIVE items for this UID (masters + active exceptions).
+            # We intentionally do NOT include CANCELLED tombstones to avoid unnecessary PATCH calls.
             try:
-                # Include CANCELLED so we can disown tombstones for this UID as well.
-                items_for_uid = await self.google.list_events_for_uid(source_name, uid, include_cancelled=True)
+                items_for_uid = await self.google.list_events_for_uid(source_name, uid, include_cancelled=False)
             except Exception as e:
                 logger.warning(f"[DISOWN][RECURRING][{source_name}] UID={uid} failed to list items for disown: {e}")
                 items_for_uid = []
-
+            
             disowned_count = 0
             for item in items_for_uid:
+                # Safety: skip if Google already marks it cancelled (shouldn't appear when include_cancelled=False)
+                status = (item.get('status') or '').upper()
+                if status == 'CANCELLED':
+                    continue
                 gid = item.get('id')
                 if not gid:
                     continue
                 ok = await self.google.disown_event(gid)
                 if ok:
                     disowned_count += 1
-            logger.info(f"[DISOWN][RECURRING][{source_name}] UID={uid} disowned {disowned_count} items prior to deletion")
-
+            logger.info(f"[DISOWN][RECURRING][{source_name}] UID={uid} disowned {disowned_count} active items prior to deletion")
+            
             logger.info(f"[DELETE][RECURRING][{source_name}] UID={uid} deleting masters={len(masters_ids)}")
             for google_id in masters_ids:
                 logger.debug(f"[DELETE][RECURRING][{source_name}] Deleting master GID={google_id}")
