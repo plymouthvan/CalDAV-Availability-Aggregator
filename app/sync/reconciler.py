@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from dateutil import rrule
 import pytz
 
+import json
 from .google_client import GoogleClient
 from database import Database
 from .event_model import EventModel
@@ -89,6 +90,300 @@ class Reconciler:
             return is_member, detail
         except Exception as e:
             return False, f"RID validation error: {e}"
+
+    # --- Split detection helpers for "This and following events" (R1 → R2) ---
+    def _rid_to_local_dt(self, master: EventModel, rid: Optional[str]) -> Optional[datetime]:
+        """
+        Parse a RECURRENCE-ID string (YYYYMMDD or YYYYMMDDTHHMMSS[Z]) into a timezone-aware
+        datetime localized to the master's timezone.
+        """
+        if not rid:
+            return None
+        tzname = master.timezone or 'UTC'
+        try:
+            event_tz = pytz.timezone(tzname)
+        except Exception:
+            event_tz = pytz.UTC
+        try:
+            if len(rid) == 8 and rid.isdigit():
+                # Date-only
+                return event_tz.localize(datetime.strptime(rid, '%Y%m%d'))
+            else:
+                # Date-time, assume UTC if Z or naive UTC form
+                if rid.endswith('Z'):
+                    rid_dt_utc = datetime.strptime(rid, '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc)
+                else:
+                    rid_dt_utc = datetime.strptime(rid, '%Y%m%dT%H%M%S').replace(tzinfo=timezone.utc)
+                return rid_dt_utc.astimezone(event_tz)
+        except Exception:
+            return None
+
+    def _extract_rrule_from_recurrence_list(self, recurrence: Optional[List[str]]) -> Optional[str]:
+        """Extract the RRULE value (without the leading 'RRULE:') from a Google recurrence array."""
+        if not recurrence:
+            return None
+        for rule in recurrence:
+            if isinstance(rule, str) and rule.startswith('RRULE:'):
+                return rule[6:]
+        return None
+
+    def _canon_rrule_str(self, rrule_str: Optional[str]) -> Optional[str]:
+        """
+        Canonicalize an RRULE string the same way our hashing does, to avoid churn
+        from WKST or INTERVAL=1 differences.
+        """
+        if not rrule_str:
+            return None
+        try:
+            tmp = EventModel(uid="__canon__", summary="", rrule=rrule_str)
+            return tmp.normalized_for_hash().get('rrule')
+        except Exception:
+            return rrule_str
+
+    def _extract_until_from_rrule(self, rrule_str: Optional[str]) -> Optional[str]:
+        """
+        Extract the UNTIL component from an RRULE string, if present, returning the raw token value.
+        """
+        if not rrule_str:
+            return None
+        try:
+            parts = [p for p in rrule_str.split(';') if p]
+            for p in parts:
+                if p.upper().startswith('UNTIL='):
+                    return p.split('=', 1)[1].strip()
+        except Exception:
+            pass
+        return None
+
+    def _build_event_highlights(self, ev: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not ev:
+            return None
+        try:
+            private = ((ev.get('extendedProperties') or {}).get('private')) or {}
+            rrule_val = self._extract_rrule_from_recurrence_list(ev.get('recurrence'))
+            return {
+                "id": ev.get("id"),
+                "iCalUID": ev.get("iCalUID"),
+                "recurringEventId": ev.get("recurringEventId"),
+                "sequence": ev.get("sequence"),
+                "status": ev.get("status"),
+                "extendedProperties.private": private,
+                "rrule": rrule_val,
+                "rrule_until": self._extract_until_from_rrule(rrule_val)
+            }
+        except Exception:
+            return {"error": "failed_to_build_highlights"}
+
+    def _log_event_comparison(self, source_name: str, ical_uid: Optional[str], original_event: Optional[Dict[str, Any]], new_event: Dict[str, Any]) -> None:
+        """
+        Emit a structured, side-by-side comparison between an existing mirrored master and a newly
+        discovered event that shares the same iCalUID but is missing our ownership property.
+        """
+        try:
+            obj = {
+                "type": "FULL_EVENT_COMPARISON",
+                "source": source_name,
+                "iCalUID": ical_uid,
+                "original_highlights": self._build_event_highlights(original_event),
+                "new_highlights": self._build_event_highlights(new_event),
+                "original_raw": original_event,
+                "new_raw": new_event
+            }
+            logger.info(json.dumps(obj, default=str))
+        except Exception:
+            logger.debug(f"[{source_name}] Failed to emit FULL_EVENT_COMPARISON for iCalUID={ical_uid}")
+
+    async def _detect_split_successor(
+        self,
+        source_name: str,
+        uid: str,
+        db_series_keys: set,
+        google_series_keys: set,
+        desired_instances: Dict[Tuple[str, Optional[str]], EventModel],
+        google_active_instances: Dict[Tuple[str, Optional[str]], EventModel],
+        until_hint: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Detect if a recurring series was split in Google UI ("This and following events").
+
+        Modes:
+        - BY_RID: Find earliest missing recurrence from DB's perspective and probe a narrow window.
+        - BY_UNTIL: If no missing RIDs exist but Google's master shows an UNTIL truncation, compute the first
+                    occurrence strictly after UNTIL using the DB rule and probe there.
+
+        Returns:
+            dict with { 'r2_master_id', 'r2_ical_uid', 'split_at' } if detected, else None
+        """
+        # Precondition: require both DB and Google active master to be present
+        db_master = desired_instances.get((uid, None))
+        google_master = google_active_instances.get((uid, None))
+        if not db_master or not google_master:
+            return None
+        try:
+            logger.info(f"[TRACE][SPLIT][{source_name}] UID={uid} db_master_gid={getattr(db_master, 'google_event_id', None)} google_master_gid={getattr(google_master, 'google_event_id', None)}")
+        except Exception:
+            logger.debug(f"[TRACE][SPLIT][{source_name}] UID={uid} master gid logging failed")
+
+        detection_mode = None
+        t0_local: Optional[datetime] = None
+        date_only = False
+
+        # Attempt BY_RID first (structural mismatch implies at least one missing instance)
+        missing = [(u, rid) for (u, rid) in db_series_keys if u == uid and rid is not None and (u, rid) not in google_series_keys]
+        if missing:
+            def rid_sort_key(pair: Tuple[str, str]):
+                _, rid = pair
+                dt_local = self._rid_to_local_dt(db_master, rid)
+                if dt_local:
+                    return dt_local.astimezone(timezone.utc)
+                return rid  # fallback
+
+            missing_sorted = sorted(missing, key=rid_sort_key)
+            rid0 = missing_sorted[0][1]
+            logger.info(f"[TRACE][SPLIT][{source_name}] UID={uid} DETECTION_MODE=BY_RID earliest_missing_rid={rid0} missing_count={len(missing_sorted)}")
+
+            # Parse rid0 → local
+            t0_local = self._rid_to_local_dt(db_master, rid0)
+            if not t0_local:
+                return None
+            date_only = len(rid0) == 8 and rid0.isdigit()
+            detection_mode = "BY_RID"
+
+        # If no missing RID but we have an UNTIL hint indicating a truncation, compute next occurrence after UNTIL
+        elif until_hint:
+            try:
+                # Resolve event timezone and master dtstart
+                tzname = db_master.timezone or 'UTC'
+                try:
+                    event_tz = pytz.timezone(tzname)
+                except Exception:
+                    event_tz = pytz.UTC
+
+                if db_master.start_datetime:
+                    dtstart = db_master.start_datetime
+                    if dtstart.tzinfo:
+                        dtstart = dtstart.astimezone(event_tz)
+                    else:
+                        dtstart = event_tz.localize(dtstart)
+                elif db_master.start_date:
+                    dtstart = event_tz.localize(datetime.strptime(db_master.start_date, '%Y-%m-%d'))
+                else:
+                    return None
+
+                # Build DB rule
+                rule = rrule.rrulestr(db_master.rrule, dtstart=dtstart) if db_master.rrule else None
+                if not rule:
+                    return None
+
+                # Parse UNTIL hint and convert to event tz
+                if len(until_hint) == 8 and until_hint.isdigit():
+                    until_local = event_tz.localize(datetime.strptime(until_hint, '%Y%m%d'))
+                else:
+                    if until_hint.endswith('Z'):
+                        until_dt_utc = datetime.strptime(until_hint, '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc)
+                    else:
+                        until_dt_utc = datetime.strptime(until_hint, '%Y%m%dT%H%M%S').replace(tzinfo=timezone.utc)
+                    until_local = until_dt_utc.astimezone(event_tz)
+
+                # First occurrence strictly after UNTIL boundary
+                t0_local = rule.after(until_local, inc=False)
+                if not t0_local:
+                    return None
+
+                date_only = bool(db_master.start_date and not db_master.start_datetime)
+                detection_mode = "BY_UNTIL"
+                logger.info(f"[TRACE][SPLIT][{source_name}] UID={uid} DETECTION_MODE=BY_UNTIL until_hint={until_hint} t0_local={t0_local.isoformat()} event_tz={getattr(event_tz,'zone',str(event_tz))}")
+            except Exception as e:
+                logger.debug(f"[{source_name}] BY_UNTIL computation failed for UID={uid}: {e}")
+                return None
+        else:
+            # No evidence to perform a split probe
+            return None
+
+        # Convert probe time to UTC and build the search window
+        t0_utc = t0_local.astimezone(timezone.utc)
+        if date_only:
+            # Use the whole UTC day for date-only instances
+            day_start = datetime(t0_utc.year, t0_utc.month, t0_utc.day, 0, 0, 0, tzinfo=timezone.utc)
+            day_end = datetime(t0_utc.year, t0_utc.month, t0_utc.day, 23, 59, 59, tzinfo=timezone.utc)
+            time_min = day_start.isoformat().replace('+00:00', 'Z')
+            time_max = day_end.isoformat().replace('+00:00', 'Z')
+        else:
+            time_min = (t0_utc - timedelta(minutes=5)).isoformat().replace('+00:00', 'Z')
+            time_max = (t0_utc + timedelta(minutes=5)).isoformat().replace('+00:00', 'Z')
+
+        logger.info(f"[TRACE][SPLIT][{source_name}] UID={uid} DETECTION_MODE={detection_mode} date_only={date_only} t0_utc={t0_utc.isoformat()} window=[{time_min}, {time_max}]")
+
+        # Require window/list + get-by-id helpers
+        if not hasattr(self.google, 'list_events_window') or not hasattr(self.google, 'get_event_by_id'):
+            logger.debug(f"[{source_name}] Split detect skipped for UID={uid}: Google client helper(s) missing.")
+            return None
+
+        try:
+            items = await self.google.list_events_window(time_min, time_max, single_events=True)
+        except Exception as e:
+            logger.warning(f"[{source_name}] Window probe failed for UID={uid}: {e}")
+            return None
+
+        def _time_matches_start(item: Dict[str, Any]) -> bool:
+            start = (item.get('start') or {})
+            dt_s = start.get('dateTime')
+            d_s = start.get('date')
+            if dt_s:
+                try:
+                    inst = datetime.fromisoformat(dt_s.replace('Z', '+00:00')).astimezone(timezone.utc)
+                    return abs((inst - t0_utc).total_seconds()) <= 60
+                except Exception:
+                    return False
+            if d_s:
+                try:
+                    return d_s == t0_utc.date().isoformat()
+                except Exception:
+                    return False
+            return False
+
+        candidates = []
+        for it in items:
+            status = (it.get('status') or '').lower()
+            if status == 'cancelled':
+                continue
+            if not it.get('recurringEventId'):
+                continue
+            private = ((it.get('extendedProperties') or {}).get('private')) or {}
+            # Skip our own mirrored artifacts; we want user-created/untracked instances
+            if private.get('caldav-mirror-source') == source_name:
+                continue
+            if _time_matches_start(it):
+                candidates.append(it)
+
+        if not candidates:
+            return None
+
+        # Canonicalize DB rule once
+        db_rr_can = self._canon_rrule_str(db_master.rrule)
+
+        for inst in candidates:
+            try:
+                master_id = inst.get('recurringEventId')
+                if not master_id:
+                    continue
+                master = await self.google.get_event_by_id(master_id)
+                if not master:
+                    continue
+                m_rr = self._extract_rrule_from_recurrence_list(master.get('recurrence'))
+                m_rr_can = self._canon_rrule_str(m_rr)
+                logger.info(f"[TRACE][RRULE_COMPARE][{source_name}] UID={uid} db_rr_can={db_rr_can} m_rr_can={m_rr_can} equal={bool(m_rr_can and db_rr_can and m_rr_can == db_rr_can)} master_id={master_id}")
+                if m_rr_can and db_rr_can and m_rr_can == db_rr_can:
+                    logger.info(f"[DETECT][SPLIT][{source_name}] UID={uid} → Found successor R2 master={master_id} at {t0_utc.isoformat()}")
+                    return {
+                        'r2_master_id': master.get('id'),
+                        'r2_ical_uid': master.get('iCalUID'),
+                        'split_at': t0_utc.isoformat()
+                    }
+            except Exception as e:
+                logger.debug(f"[{source_name}] Candidate evaluation failed for UID={uid}: {e}")
+
+        return None
 
     async def _purge_all_google_artifacts_for_uid(self, source_name: str, uid: str):
         """No-op: sweep disabled in disown-before-delete model."""
@@ -187,7 +482,96 @@ class Reconciler:
         for uid in all_uids:
             db_series_keys = {k for k in db_keys if k[0] == uid}
             google_series_keys = {k for k in google_keys if k[0] == uid}
+            try:
+                logger.info(f"[TRACE][SERIES_START][{source_name}] UID={uid} db_series_keys={sorted(list(db_series_keys))} google_series_keys={sorted(list(google_series_keys))}")
+            except Exception:
+                logger.debug(f"[TRACE][SERIES_START][{source_name}] UID={uid} series keys logging failed")
 
+            # --- iCalUID-level reconciliation diagnostics ---
+            original_master_raw = google_events_raw.get((uid, None))
+            ical_uid = (original_master_raw or {}).get('iCalUID')
+
+            items_by_ical: List[Dict[str, Any]] = []
+            if ical_uid and hasattr(self.google, 'list_events_by_icaluid'):
+                try:
+                    items_by_ical = await self.google.list_events_by_icaluid(ical_uid, include_cancelled=True)
+                except Exception as e:
+                    logger.warning(f"[{source_name}] iCalUID probe failed for UID={uid}, iCalUID={ical_uid}: {e}")
+
+            try:
+                suspect_masters: List[Dict[str, Any]] = []
+                suspect_instances: List[Dict[str, Any]] = []
+                total_masters = 0
+
+                original_master_id = (original_master_raw or {}).get("id")
+                if not original_master_id:
+                    gm = google_active_instances.get((uid, None))
+                    if gm and gm.google_event_id:
+                        original_master_id = gm.google_event_id
+
+                for it in items_by_ical:
+                    status = (it.get('status') or '').lower()
+                    private = ((it.get('extendedProperties') or {}).get('private')) or {}
+                    is_master = bool(it.get('recurrence')) and not it.get('recurringEventId')
+
+                    if is_master:
+                        total_masters += 1
+                        if private.get('caldav-mirror-source') != source_name:
+                            suspect_masters.append(it)
+                    else:
+                        reid = it.get('recurringEventId')
+                        # Flag instances that point to a different master OR lack our ownership property
+                        if (reid and original_master_id and reid != original_master_id) or (private.get('caldav-mirror-source') != source_name):
+                            if status != 'cancelled':
+                                suspect_instances.append(it)
+
+                logger.info(json.dumps({
+                    "type": "RECONCILIATION_START",
+                    "source": source_name,
+                    "uid": uid,
+                    "iCalUID": ical_uid,
+                    "found_count": len(items_by_ical),
+                    "master_count": total_masters,
+                    "suspect_master_count": len(suspect_masters),
+                    "suspect_instance_count": len(suspect_instances)
+                }))
+
+                for sm in suspect_masters:
+                    self._log_event_comparison(source_name, ical_uid, original_master_raw, sm)
+                    logger.info(json.dumps({
+                        "type": "SPLIT_EVENT_DETECTED",
+                        "source": source_name,
+                        "iCalUID": ical_uid,
+                        "new_id": sm.get("id"),
+                        "original_id": (original_master_raw or {}).get("id"),
+                        "reason": "Same iCalUID but missing ownership property (master)"
+                    }))
+
+                for si in suspect_instances:
+                    self._log_event_comparison(source_name, ical_uid, original_master_raw, si)
+                    reason = "Different recurringEventId vs active master" if (original_master_id and si.get('recurringEventId') and si.get('recurringEventId') != original_master_id) else "Missing ownership property"
+                    logger.info(json.dumps({
+                        "type": "SPLIT_EVENT_DETECTED",
+                        "source": source_name,
+                        "iCalUID": ical_uid,
+                        "new_id": si.get("id"),
+                        "original_id": (original_master_raw or {}).get("id"),
+                        "reason": reason
+                    }))
+
+                for sm in suspect_masters:
+                    self._log_event_comparison(source_name, ical_uid, original_master_raw, sm)
+                    logger.info(json.dumps({
+                        "type": "SPLIT_EVENT_DETECTED",
+                        "source": source_name,
+                        "iCalUID": ical_uid,
+                        "new_id": sm.get("id"),
+                        "original_id": (original_master_raw or {}).get("id"),
+                        "reason": "Same iCalUID but missing ownership property"
+                    }))
+            except Exception:
+                logger.debug(f"[{source_name}] iCalUID diagnostics failed for UID={uid}")
+ 
             # A series is recurring if it has exceptions or if its master event has an RRULE.
             is_recurring = any(k[1] is not None for k in db_series_keys | google_series_keys)
             if not is_recurring:
@@ -205,6 +589,8 @@ class Reconciler:
             # If any CANCELLED instances were detected for this UID, replace the series.
             if uid in uids_with_cancelled_instances and db_series_keys:
                 logger.info(f"[{source_name}] CANCELLED instances detected on Google for UID={uid}. Replacing series.")
+                logger.warning(f"[TRACE][QUEUE_REPLACE][{source_name}] UID={uid} action=series_replacement reason=cancelled_instances")
+                logger.info(json.dumps({"type": "DECISION", "action": "REPLACE_SERIES", "reason": "cancelled_instances", "source": source_name, "uid": uid}))
                 series_to_replace.add(uid)
                 continue
 
@@ -213,14 +599,94 @@ class Reconciler:
             if not is_recurring:
                 continue # Skip to next UID, non-recurring events are handled later
 
-            # If the set of instances is different, the whole series must be replaced.
+            # Check for splits on both structural and content mismatches of the master
+            # Ensure truncation hints are always defined, even for structural-only mismatches
+            until_g = None
+            until_db = None
+            is_mismatch = False
             if db_series_keys != google_series_keys:
-                logger.info(f"[{source_name}] Series {uid} has a structural mismatch. DB keys: {db_series_keys}, Google keys: {google_series_keys}. Replacing.")
-                series_to_replace.add(uid)
-                continue
+                logger.info(f"[{source_name}] Series {uid} has a structural mismatch. DB keys: {db_series_keys}, Google keys: {google_series_keys}.")
+                is_mismatch = True
+            else:
+                # Check for content mismatch on the master, which is often the first sign of a split (truncated RRULE)
+                master_key = (uid, None)
+                if master_key in db_series_keys:
+                    db_master = desired_instances[master_key]
+                    google_master = google_active_instances.get(master_key)
+                    if google_master:
+                        # Canonical RRULEs and hashes for master comparison (split signal)
+                        try:
+                            db_rr_can = self._canon_rrule_str(db_master.rrule)
+                            gm_rr_can = self._canon_rrule_str(google_master.rrule)
+                        except Exception:
+                            db_rr_can = db_master.rrule
+                            gm_rr_can = google_master.rrule if google_master else None
+                        db_hash = db_master.compute_hash()
+                        gm_hash = google_master.compute_hash()
+                        logger.info(f"[TRACE][MASTER_COMPARE][{source_name}] UID={uid} db_rr_can={db_rr_can} gm_rr_can={gm_rr_can} db_hash={db_hash} gm_hash={gm_hash} equal={db_hash == gm_hash}")
+                        if db_hash != gm_hash:
+                            logger.info(f"[{source_name}] Series {uid} has a content mismatch in master instance. Checking for split.")
+                            # Initialize truncation hints so they are visible outside the try/except
+                            until_g = None
+                            until_db = None
+                            try:
+                                until_g = self._extract_until_from_rrule(google_master.rrule)
+                                until_db = self._extract_until_from_rrule(db_master.rrule)
+                                if until_g and (not until_db or until_g != until_db):
+                                    logger.info(json.dumps({
+                                        "type": "STATE_MISMATCH",
+                                        "reason": "GOOGLE_TRUNCATION_DETECTED",
+                                        "source": source_name,
+                                        "uid": uid,
+                                        "google_event_id": google_master.google_event_id,
+                                        "iCalUID": ical_uid if 'ical_uid' in locals() else None,
+                                        "google_rrule": google_master.rrule,
+                                        "db_rrule": db_master.rrule,
+                                        "google_until": until_g,
+                                        "db_until": until_db
+                                    }))
+                            except Exception:
+                                logger.debug(f"[{source_name}] Truncation diagnostics failed for UID={uid}")
+                            is_mismatch = True
 
-            # If the structure is the same, check for content changes.
+            if is_mismatch:
+                split_info = await self._detect_split_successor(
+                    source_name=source_name,
+                    uid=uid,
+                    db_series_keys=db_series_keys,
+                    google_series_keys=google_series_keys,
+                    desired_instances=desired_instances,
+                    google_active_instances=google_active_instances,
+                    until_hint=until_g
+                )
+
+                if split_info:
+                    # This is an invalid modification. Per philosophy, we must revert it.
+                    # 1. Immediately delete the new successor series (R2)
+                    r2_id = split_info.get('r2_master_id')
+                    if r2_id:
+                        logger.info(json.dumps({"type": "SPLIT_EVENT_DETECTED", "source": source_name, "uid": uid, "iCalUID": ical_uid if 'ical_uid' in locals() else None, "new_id": r2_id, "original_id": (google_active_instances.get((uid, None)).google_event_id if (uid, None) in google_active_instances else None)}))
+                        logger.info(f"[{source_name}] Split detected for UID={uid}. Deleting invalid successor series R2={r2_id}.")
+                        await self.google.delete_event(r2_id)
+
+                    # 2. Add the original series (R1) to the replacement plan. This will
+                    #    trigger the standard disown->delete->recreate flow, which will
+                    #    clean up the truncated R1 and recreate the series from DB truth.
+                    logger.info(f"[{source_name}] Adding original series UID={uid} to replacement plan to revert split.")
+                    logger.info(json.dumps({"type": "DECISION", "action": "REPLACE_SERIES", "reason": "split_detected", "source": source_name, "uid": uid}))
+                    series_to_replace.add(uid)
+                    continue
+                else:
+                    # If it's a mismatch but not a detectable split, replace the series.
+                    logger.info(f"[{source_name}] Mismatch for UID={uid} is not a split. Replacing series.")
+                    logger.warning(f"[TRACE][QUEUE_REPLACE][{source_name}] UID={uid} action=series_replacement reason=mismatch_not_split")
+                    logger.info(json.dumps({"type": "DECISION", "action": "REPLACE_SERIES", "reason": "mismatch_not_split", "source": source_name, "uid": uid}))
+                    series_to_replace.add(uid)
+                    continue
+
+            # If the structure is the same, check for content changes on exceptions
             for key in db_series_keys:
+                if key[1] is None: continue # Master already checked
                 db_model = desired_instances[key]
                 google_model = google_active_instances.get(key)
 

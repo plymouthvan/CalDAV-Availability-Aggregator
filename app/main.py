@@ -68,13 +68,23 @@ def load_configuration() -> Dict[str, Any]:
 
 async def main():
     """Main entry point for the CalDAV Mirror service."""
+    # Quiet default noise; enable targeted DEBUG where we need diagnostics
     logger = setup_logger(level="INFO")
     logger.info("Starting CalDAV Mirror service...")
 
-    logging.getLogger("app.sync.event_model").setLevel(logging.INFO)
-    logging.getLogger("app.sync.reconciler").setLevel(logging.INFO)
-    logging.getLogger("app.sync.google_client").setLevel(logging.INFO)
+    # Focus detailed diagnostics on reconciler + google client only
+    logging.getLogger("sync.event_model").setLevel(logging.INFO)
+    logging.getLogger("sync.reconciler").setLevel(logging.DEBUG)
+    logging.getLogger("sync.google_client").setLevel(logging.DEBUG)
+
+    # Silence noisy third-party libs
     logging.getLogger("aiosqlite").setLevel(logging.INFO)
+    logging.getLogger("icalendar").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    logging.getLogger("charset_normalizer").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("google").setLevel(logging.WARNING)
 
     try:
         # 1. Load Configuration

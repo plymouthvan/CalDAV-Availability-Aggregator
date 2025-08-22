@@ -28,6 +28,24 @@ class GoogleClient:
         self.calendar_id = calendar_id
         self._session: Optional[aiohttp.ClientSession] = None
 
+    def _log_api_call(self, action: str, http_method: str, url: str, payload: Optional[Dict[str, Any]] = None, context: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Emit a structured JSON log for outbound Google Calendar API calls.
+        """
+        try:
+            log_obj = {
+                "type": "API_CALL",
+                "action": action,
+                "http_method": http_method,
+                "url": url,
+                "calendar_id": self.calendar_id,
+                "payload": payload,
+                "context": context or {}
+            }
+            logger.info(json.dumps(log_obj, default=str))
+        except Exception:
+            logger.debug(f"[API_CALL][{action}] Failed to serialize payload for logging.")
+
     async def _get_auth_headers(self) -> Dict[str, str]:
         """Get authorization headers with a valid access token."""
         access_token = await self.oauth.get_access_token()
@@ -45,6 +63,15 @@ class GoogleClient:
         headers["Content-Type"] = "application/json"
         
         google_event_data = event.to_google_event()
+
+        # Structured API_CALL payload log
+        self._log_api_call(
+            action="events.insert",
+            http_method="POST",
+            url=url,
+            payload=google_event_data,
+            context={"uid": event.uid, "recurrence_id": event.recurrence_id}
+        )
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -70,6 +97,15 @@ class GoogleClient:
         headers = await self._get_auth_headers()
         headers["Content-Type"] = "application/json"
         google_event_data = event.to_google_event()
+
+        # Structured API_CALL payload log
+        self._log_api_call(
+            action="events.update",
+            http_method="PUT",
+            url=url,
+            payload=google_event_data,
+            context={"uid": event.uid, "recurrence_id": event.recurrence_id, "google_event_id": google_event_id}
+        )
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -135,16 +171,16 @@ class GoogleClient:
                         data = await response.json()
                         items = data.get('items', [])
                         
-                        if logger.isEnabledFor(logging.DEBUG):
-                            for item in items:
-                                logger.debug(
-                                    f"[RAW GOOGLE EVENT] ID: {item.get('id')}, "
-                                    f"Summary: {item.get('summary')}, "
-                                    f"Status: {item.get('status')}, "
-                                    f"Start: {item.get('start', {}).get('dateTime')}, "
-                                    f"OriginalStart: {item.get('originalStartTime')}, "
-                                    f"ExtendedProps: {item.get('extendedProperties')}"
-                                )
+                        # if logger.isEnabledFor(logging.DEBUG):
+                        #     for item in items:
+                        #         logger.debug(
+                        #             f"[RAW GOOGLE EVENT] ID: {item.get('id')}, "
+                        #             f"Summary: {item.get('summary')}, "
+                        #             f"Status: {item.get('status')}, "
+                        #             f"Start: {item.get('start', {}).get('dateTime')}, "
+                        #             f"OriginalStart: {item.get('originalStartTime')}, "
+                        #             f"ExtendedProps: {item.get('extendedProperties')}"
+                        #         )
 
                         logger.debug(f"Received page with {len(items)} items.")
 
@@ -313,6 +349,15 @@ class GoogleClient:
             }
         }
 
+        # Structured API_CALL payload log
+        self._log_api_call(
+            action="events.patch",
+            http_method="PATCH",
+            url=url,
+            payload=payload,
+            context={"purpose": "disown", "google_event_id": google_event_id}
+        )
+
         try:
             async with aiohttp.ClientSession() as session:
                 # PATCH so we don't need to send the full event body
@@ -366,6 +411,76 @@ class GoogleClient:
         logger.info(f"Found {len(instances)} instances for Google event ID: {google_event_id}")
         return instances
 
+    async def list_events_by_icaluid(self, ical_uid: str, include_cancelled: bool = False) -> List[Dict[str, Any]]:
+        """
+        List all events across the calendar that share the given iCalUID.
+        Useful for diagnosing split-series where a successor series lacks our ownership property.
+        """
+        logger.info(f"Listing events by iCalUID: {ical_uid} include_cancelled={include_cancelled}")
+        params = {
+            'iCalUID': ical_uid,
+            'showDeleted': "true" if include_cancelled else "false",
+            'maxResults': 2500,
+            'fields': 'items(id,iCalUID,recurringEventId,recurrence,sequence,status,summary,updated,start,end,extendedProperties/private),nextPageToken',
+        }
+        items = await self._list_events_paginated(params)
+        logger.info(f"Found {len(items)} items for iCalUID {ical_uid}")
+        return items
+
+    async def list_events_window(self, time_min: str, time_max: str, single_events: bool = True) -> List[Dict[str, Any]]:
+        """
+        List events in a narrow time window across the entire calendar (not restricted to our privateExtendedProperty).
+        Useful for detecting split-successor series (R2) by probing around a specific timestamp.
+
+        Args:
+            time_min: RFC3339 UTC (e.g., 2024-01-01T00:00:00Z)
+            time_max: RFC3339 UTC
+            single_events: When true, expands recurring instances (required for orderBy=startTime)
+
+        Returns:
+            List of raw Google event dicts
+        """
+        logger.info(f"Listing events window: {time_min} to {time_max}, singleEvents={single_events}")
+        params = {
+            'timeMin': time_min,
+            'timeMax': time_max,
+            'singleEvents': "true" if single_events else None,
+            'orderBy': "startTime" if single_events else None,
+            'showDeleted': "false",
+            'maxResults': 2500,
+            'maxAttendees': 0,
+            'fields': 'items(id,iCalUID,recurringEventId,originalStartTime,recurrence,status,start,end,summary,extendedProperties/private),nextPageToken',
+        }
+        items = await self._list_events_paginated(params)
+        logger.info(f"Found {len(items)} items in window.")
+        return items
+
+    async def get_event_by_id(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a single Google Calendar event by ID with a minimal field set.
+        Used to fetch the master of a recurring instance candidate during split detection.
+        """
+        logger.debug(f"Fetching Google event by id: {event_id}")
+        url = f"{self.API_BASE_URL}/calendars/{self.calendar_id}/events/{event_id}"
+        headers = await self._get_auth_headers()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, params={
+                    'fields': 'id,iCalUID,recurrence,summary,start,end,updated,sequence,extendedProperties/private'
+                }) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data
+                    elif response.status in [404, 410]:
+                        logger.info(f"Event {event_id} not found (status={response.status})")
+                        return None
+                    else:
+                        txt = await response.text()
+                        logger.error(f"get_event_by_id failed: {response.status} - {txt}")
+                        return None
+        except Exception as e:
+            logger.error(f"Error in get_event_by_id({event_id}): {e}", exc_info=True)
+            return None
     async def batch_create_events(self, events: List[EventModel]) -> Dict[Tuple[str, Optional[str]], str]:
         if not events: return {}
         logger.info(f"Batch creating {len(events)} Google events...")
@@ -374,8 +489,10 @@ class GoogleClient:
         headers["Content-Type"] = "multipart/mixed; boundary=batch_boundary"
 
         body = ""
+        payloads: List[Dict[str, Any]] = []
         for event in events:
             event_data = event.to_google_event()
+            payloads.append(event_data)
             logger.debug(f"Batch Create Payload for UID {event.uid}: {json.dumps(event_data, indent=2)}")
             if event.is_master_event:
                 logger.debug(f"  Master Event Details: UID={event.uid}, Recurrence={event_data.get('recurrence')}")
@@ -393,6 +510,15 @@ class GoogleClient:
             body += "Content-Type: application/json\n\n"
             body += json.dumps(event_data) + "\n"
         body += "--batch_boundary--"
+
+        # Structured API_CALL payload log (batch)
+        self._log_api_call(
+            action="batch/events.insert",
+            http_method="POST",
+            url=batch_url,
+            payload={"parts": payloads},
+            context={"count": len(events)}
+        )
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -471,8 +597,10 @@ class GoogleClient:
         headers["Content-Type"] = "multipart/mixed; boundary=batch_boundary"
 
         body = ""
+        payloads: List[Dict[str, Any]] = []
         for google_event_id, event in events_to_update:
             event_data = event.to_google_event()
+            payloads.append({"google_event_id": google_event_id, "event": event_data})
             logger.debug(f"Batch Update Payload for GID {google_event_id} (UID {event.uid}): {json.dumps(event_data, indent=2)}")
             if event.is_master_event:
                 logger.debug(f"  Master Event Details: UID={event.uid}, Recurrence={event_data.get('recurrence')}")
@@ -490,6 +618,15 @@ class GoogleClient:
             body += "Content-Type: application/json\n\n"
             body += json.dumps(event_data) + "\n"
         body += "--batch_boundary--"
+
+        # Structured API_CALL payload log (batch)
+        self._log_api_call(
+            action="batch/events.update",
+            http_method="POST",
+            url=batch_url,
+            payload={"parts": payloads},
+            context={"count": len(events_to_update)}
+        )
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -520,6 +657,15 @@ class GoogleClient:
             body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
             body += f"DELETE /calendar/v3/calendars/{self.calendar_id}/events/{google_event_id}?sendUpdates=none\n"
         body += "--batch_boundary--"
+
+        # Structured API_CALL payload log (batch delete)
+        self._log_api_call(
+            action="batch/events.delete",
+            http_method="POST",
+            url=batch_url,
+            payload={"ids": google_event_ids},
+            context={"count": len(google_event_ids)}
+        )
 
         try:
             async with aiohttp.ClientSession() as session:
