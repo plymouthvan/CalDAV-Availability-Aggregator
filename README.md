@@ -15,10 +15,10 @@ CalDAV Mirror is a headless background service that aggregates events from one o
 
 ## 💡 Philosophy
 
-- Google Calendar is a mirror, **not** a source of truth
-- CalDAV sources are authoritative
-- The local database is the system’s memory and decision-maker
-- Syncing is one-way (CalDAV → Google)
+- Dedicated destination calendar required (empty and exclusively managed by this service)
+- The internal database is the single source of truth; Google Calendar is a mirror
+- CalDAV sources are authoritative; edits on Google are reverted or deleted
+- One-way sync (CalDAV → Google)
 - No UI. No surprises. Just logs and YAML.
 
 ## 📦 Installation
@@ -46,9 +46,10 @@ CalDAV Mirror is a headless background service that aggregates events from one o
     # Generate one with: openssl rand -hex 32
     ENCRYPTION_KEY=your-super-secret-32-byte-encryption-key
 
-    # ID of the Google Calendar to sync to. Defaults to "primary".
-    # Find this in your Google Calendar settings.
-    GOOGLE_CALENDAR_ID=primary
+    # ID of the Google Calendar to sync to.
+    # IMPORTANT: Create a dedicated, empty calendar and use its ID here. Do NOT use your "Primary" calendar.
+    # The service will refuse to start on first run if the calendar is not empty.
+    GOOGLE_CALENDAR_ID=your-dedicated-calendar-id@group.calendar.google.com
 
     # Path to the database file inside the container.
     # It's recommended to leave this as the default.
@@ -90,12 +91,28 @@ Startup will fail if this file is missing or malformed.
 
 ## 🧠 Sync Behavior
 
-1. Pull new/updated/deleted events using chosen sync method
+1. Pull new/updated/deleted events from CalDAV sources using the configured method
 2. Normalize and hash event data
-3. Store or update events in local DB with internal IDs
-4. Push new/changed events to Google Calendar
-5. Revert any changes to mirrored events on Google
-6. Leave unrelated Google events untouched
+3. Persist desired state in the local DB
+4. Reconcile Google Calendar to match DB exactly:
+   - Create any DB event missing on Google
+   - Update any differing Google event to match DB
+   - Delete any Google event that is not present in the DB (including user-created or split recurring series)
+5. Changes made directly on the destination calendar are removed on the next sync
+
+## ⚠️ Dedicated Calendar Requirement & Data Loss Warning
+
+This application now requires a dedicated, empty Google Calendar that it exclusively manages.
+
+- On first run (when the local DB has no events), startup will fail if the selected Google Calendar contains any events.
+- Do NOT point this tool at your primary calendar.
+- Anything manually created on the destination Google Calendar (including events created via Google UI, mobile apps, or third-party integrations) will be automatically deleted on the next sync cycle unless it originates from your CalDAV sources and is present in the local database.
+- If a user splits a recurring event on Google using “This and following events,” Google will create a new series. That new series will not exist in the database and will be deleted on the next sync.
+
+To proceed safely:
+- Create a brand-new Google Calendar (Settings → Add calendar → Create new calendar).
+- Use its calendar ID in GOOGLE_CALENDAR_ID.
+- Keep that calendar exclusively managed by CalDAV Mirror.
 
 ## 🗃️ Database
 

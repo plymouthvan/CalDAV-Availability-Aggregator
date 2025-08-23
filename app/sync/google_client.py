@@ -481,6 +481,39 @@ class GoogleClient:
         except Exception as e:
             logger.error(f"Error in get_event_by_id({event_id}): {e}", exc_info=True)
             return None
+    async def is_calendar_empty(self) -> bool:
+        """
+        Return True if the destination Google Calendar has no active events.
+        Used for enforcing the dedicated, empty calendar requirement on first run.
+        """
+        logger.info("Checking if Google Calendar is empty...")
+        try:
+            # showDeleted defaults to false in _list_events_paginated when not provided
+            items = await self._list_events_paginated({'maxResults': 1})
+            empty = len(items) == 0
+            logger.info(f"Calendar empty: {empty}")
+            return empty
+        except Exception as e:
+            logger.error(f"Failed to check calendar emptiness: {e}", exc_info=True)
+            # Be conservative: treat as not empty if we cannot determine
+            return False
+
+    async def list_all_events_active(self) -> List[Dict[str, Any]]:
+        """
+        List all active (non-deleted) events in the destination calendar, without filtering
+        by privateExtendedProperty. This is used for the global sweep that removes any events
+        that do not originate from our database.
+        """
+        logger.info("Listing all active events in destination calendar (no filtering).")
+        params = {
+            'maxResults': 2500,
+            'showDeleted': "false",
+            # Include originalStartTime so exceptions can be correctly keyed by RECURRENCE-ID
+            'fields': 'items(id,iCalUID,recurringEventId,originalStartTime,recurrence,status,summary,start,end,extendedProperties/private),nextPageToken',
+        }
+        items = await self._list_events_paginated(params)
+        logger.info(f"Found {len(items)} active events in destination calendar.")
+        return items
     async def batch_create_events(self, events: List[EventModel]) -> Dict[Tuple[str, Optional[str]], str]:
         if not events: return {}
         logger.info(f"Batch creating {len(events)} Google events...")

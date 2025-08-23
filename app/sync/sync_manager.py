@@ -112,8 +112,8 @@ class SyncManager:
                             google_recurring_event_id=event.google_recurring_event_id
                         )
 
-            # 4. Trigger the reconciliation process
-            await self.reconciler.reconcile_source(self.source_name)
+            # 4. Trigger the reconciliation process (simplified, dedicated calendar model)
+            await self.reconciler.reconcile_source_simple(self.source_name)
 
             # 5. Update sync state
             if new_sync_state:

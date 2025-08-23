@@ -346,3 +346,10 @@ class Database:
             
             row = await cursor.fetchone()
             return row[0] if row else None
+
+    async def count_events(self) -> int:
+        """Return the total number of event instances stored across all sources."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM events")
+            row = await cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0

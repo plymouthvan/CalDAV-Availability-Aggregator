@@ -7,7 +7,7 @@ the database.
 """
 
 import logging
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Set
 from datetime import datetime, timedelta, timezone
 from dateutil import rrule
 import pytz
@@ -912,3 +912,743 @@ class Reconciler:
 
         logger.info(f"Reconciliation finished for source: {source_name}")
 
+
+    async def reconcile_source_simple(self, source_name: str):
+        """
+        Dedicated-calendar reconciliation (simplified, aggressive model).
+
+        Rules:
+        - DB is the single source of truth.
+        - Create: Any DB event missing on Google is created.
+        - Update: Any differing Google event is updated to match DB.
+        - Delete:
+            * Any Google event without our extendedProperties (manual/user-created) is deleted.
+            * Any Google event owned by this source_name but not present in DB is deleted.
+          Events owned by other sources (with caldav-mirror-source != source_name) are left untouched.
+
+        This inherently resolves "split recurring series" duplications:
+        - The user-created successor series will lack our extendedProperties => deleted on next sync.
+        - The truncated original series (if Google modified it) will be updated from DB truth.
+        """
+        logger.info(f"[SIMPLE] Start reconciliation for source '{source_name}' (dedicated calendar mode)")
+
+        # 1) Load desired state from DB (this source only)
+        db_events_raw = await self.db.get_all_events_for_source(source_name)
+        desired: Dict[Tuple[str, Optional[str]], EventModel] = {
+            key: EventModel.from_dict(val['event_data'])
+            for key, val in db_events_raw.items()
+        }
+        desired_keys = set(desired.keys())
+        logger.debug(f"[SIMPLE][{source_name}] Desired keys={len(desired_keys)}")
+
+        # 2) Load all active Google events (across entire calendar)
+        all_google_items: List[Dict[str, Any]] = await self.google.list_all_events_active()
+
+        # Partition google events:
+        # - same_source_map: events for this source_name keyed by (uid, recurrence_id)
+        # - to_delete_ids: IDs lacking our extendedProperties (user-created/unmanaged)
+        same_source_map: Dict[Tuple[str, Optional[str]], EventModel] = {}
+        to_delete_ids: List[str] = []
+        kept_other_sources = 0
+        # Track UIDs where we saw malformed owned exceptions so we can reset the whole series
+        malformed_owned_uids: Set[str] = set()
+
+        for item in all_google_items:
+            status = (item.get('status') or '').upper()
+            if status == 'CANCELLED':
+                # We requested active-only, but guard anyway.
+                continue
+
+            private = ((item.get('extendedProperties') or {}).get('private')) or {}
+            item_source = private.get('caldav-mirror-source')
+            item_uid = private.get('caldav-mirror-uid')
+            is_master = bool(item.get('recurrence')) and not item.get('recurringEventId')
+            gid = item.get('id')
+            ical = item.get('iCalUID')
+            rec_id = item.get('recurringEventId')
+
+            # If it's ours but belongs to a different source, leave it alone.
+            if item_source and item_source != source_name:
+                kept_other_sources += 1
+                try:
+                    logger.info(json.dumps({
+                        "type": "SIMPLE_CLASSIFY",
+                        "category": "other_source",
+                        "source": source_name,
+                        "item_source": item_source,
+                        "id": gid,
+                        "iCalUID": ical,
+                        "is_master": is_master,
+                        "recurringEventId": rec_id
+                    }))
+                except Exception:
+                    pass
+                continue
+
+            if item_source == source_name:
+                model = EventModel.from_google_event(item)
+                # from_google_event returns None for malformed exceptions; skip those defensively
+                if not model or not model.uid:
+                    if gid:
+                        to_delete_ids.append(gid)
+                    # Mark the series for reset if the malformed item is one of ours and is an exception
+                    if item_uid and not is_master:
+                        malformed_owned_uids.add(item_uid)
+                    try:
+                        logger.info(json.dumps({
+                            "type": "SIMPLE_CLASSIFY",
+                            "category": "ours_malformed",
+                            "source": source_name,
+                            "id": gid,
+                            "iCalUID": ical,
+                            "is_master": is_master,
+                            "recurringEventId": rec_id,
+                            "private_uid": item_uid
+                        }))
+                    except Exception:
+                        pass
+                    continue
+
+                key = (model.uid, model.recurrence_id)
+                # Detect duplicates mapped to same (uid, recurrence_id) and delete the extra owned item
+                if key in same_source_map:
+                    existing = same_source_map[key]
+                    gid_dup = gid
+                    if gid_dup:
+                        to_delete_ids.append(gid_dup)
+                    try:
+                        logger.info(json.dumps({
+                            "type": "DUPLICATE_OWNED_KEY",
+                            "source": source_name,
+                            "key": [model.uid, model.recurrence_id],
+                            "keep_google_id": existing.google_event_id,
+                            "drop_google_id": gid_dup
+                        }))
+                    except Exception:
+                        pass
+                    continue
+
+                same_source_map[key] = model
+                try:
+                    logger.info(json.dumps({
+                        "type": "SIMPLE_CLASSIFY",
+                        "category": "ours_master" if is_master else "ours_exception",
+                        "source": source_name,
+                        "id": gid,
+                        "iCalUID": ical,
+                        "recurringEventId": rec_id,
+                        "key": [model.uid, model.recurrence_id]
+                    }))
+                except Exception:
+                    pass
+            else:
+                # No ownership marker at all -> unmanaged -> delete
+                if gid:
+                    to_delete_ids.append(gid)
+                try:
+                    logger.info(json.dumps({
+                        "type": "SIMPLE_CLASSIFY",
+                        "category": "unmanaged",
+                        "source": source_name,
+                        "id": gid,
+                        "iCalUID": ical,
+                        "is_master": is_master,
+                        "recurringEventId": rec_id
+                    }))
+                except Exception:
+                    pass
+
+        logger.info(f"[SIMPLE][{source_name}] Google totals: same_source={len(same_source_map)}, delete_unmanaged={len(to_delete_ids)}, kept_other_sources={kept_other_sources}")
+
+        # --- Diagnostics: detect duplicate masters per iCalUID and RRULE truncation mismatches ---
+        try:
+            # Map raw items by id for quick lookups
+            raw_by_id = {it.get('id'): it for it in all_google_items if it.get('id')}
+
+            # Group owned masters by iCalUID
+            owned_masters_by_ical: Dict[str, List[Dict[str, Any]]] = {}
+            for item in all_google_items:
+                status = (item.get('status') or '').upper()
+                if status == 'CANCELLED':
+                    continue
+                private = ((item.get('extendedProperties') or {}).get('private')) or {}
+                if private.get('caldav-mirror-source') != source_name:
+                    continue
+                is_master = bool(item.get('recurrence')) and not item.get('recurringEventId')
+                if not is_master:
+                    continue
+                ical_uid = item.get('iCalUID')
+                if ical_uid:
+                    owned_masters_by_ical.setdefault(ical_uid, []).append(item)
+
+            dup_groups = {ical: items for ical, items in owned_masters_by_ical.items() if len(items) > 1}
+            if dup_groups:
+                # Summary
+                logger.info(json.dumps({
+                    "type": "DIAG_DUPLICATE_MASTERS",
+                    "source": source_name,
+                    "group_count": len(dup_groups),
+                    "total_masters": sum(len(v) for v in dup_groups.values()),
+                }))
+                # Per-group details
+                for ical, items in dup_groups.items():
+                    highlights = [self._build_event_highlights(it) for it in items]
+                    logger.info(json.dumps({
+                        "type": "DUPLICATE_MASTERS_GROUP",
+                        "source": source_name,
+                        "iCalUID": ical,
+                        "items": highlights
+                    }))
+        except Exception as e:
+            logger.debug(f"[SIMPLE][{source_name}] duplicate-masters diagnostics failed: {e}")
+        # Duplicate masters by our private UID across all events -> unconditional reset
+        try:
+            masters_by_private_uid: Dict[str, List[Dict[str, Any]]] = {}
+            for item in all_google_items:
+                status = (item.get('status') or '').upper()
+                if status == 'CANCELLED':
+                    continue
+                private = ((item.get('extendedProperties') or {}).get('private')) or {}
+                if private.get('caldav-mirror-source') != source_name:
+                    continue
+                # Treat as master when it has recurrence and no recurringEventId
+                if item.get('recurrence') and not item.get('recurringEventId'):
+                    owner_uid = private.get('caldav-mirror-uid')
+                    if owner_uid:
+                        masters_by_private_uid.setdefault(owner_uid, []).append(item)
+
+            for owner_uid, masters in masters_by_private_uid.items():
+                if len(masters) >= 2:
+                    # Disown all active items for this UID so trash tombstones won't match our filters
+                    disowned3 = 0
+                    try:
+                        items_for_uid = await self.google.list_events_for_uid(source_name, owner_uid, include_cancelled=False)
+                    except Exception as e:
+                        logger.warning(f"[SIMPLE][{source_name}] list_events_for_uid failed for UID={owner_uid}: {e}")
+                        items_for_uid = []
+                    for it in items_for_uid:
+                        status2 = (it.get('status') or '').upper()
+                        if status2 == 'CANCELLED':
+                            continue
+                        gid2 = it.get('id')
+                        if not gid2:
+                            continue
+                        ok = await self.google.disown_event(gid2)
+                        if ok:
+                            disowned3 += 1
+
+                    # Delete all masters we found for this UID (both/all)
+                    master_ids = [it.get('id') for it in masters if it.get('id')]
+                    if master_ids:
+                        to_delete_ids.extend(master_ids)
+
+                    logger.info(json.dumps({
+                        "type": "RESET_SERIES_DUPLICATE_BY_PRIVATE_UID",
+                        "source": source_name,
+                        "uid": owner_uid,
+                        "masters": master_ids,
+                        "disowned_count": disowned3,
+                        "count": len(masters)
+                    }))
+
+                    # Schedule DB re-create for the entire series
+                    reset_uids.add(owner_uid)
+                    for (k_uid, k_rid), ev in desired.items():
+                        if k_uid == owner_uid:
+                            create_after_reset[(k_uid, k_rid)] = ev
+        except Exception as e:
+            logger.debug(f"[SIMPLE][{source_name}] duplicate-by-private-uid reset failed: {e}")
+
+        try:
+            # RRULE mismatch diagnostics between DB master and Google master (owned)
+            masters_by_uid_db: Dict[str, EventModel] = {uid: model for (uid, rid), model in desired.items() if rid is None}
+            masters_by_uid_google: Dict[str, EventModel] = {uid: model for (uid, rid), model in same_source_map.items() if rid is None}
+
+            for uid, g_model in masters_by_uid_google.items():
+                db_model = masters_by_uid_db.get(uid)
+                if not db_model:
+                    continue
+
+                db_rr_can = self._canon_rrule_str(db_model.rrule)
+                g_rr_can = self._canon_rrule_str(g_model.rrule)
+                if db_rr_can != g_rr_can:
+                    raw = raw_by_id.get(g_model.google_event_id)
+                    ical = (raw or {}).get('iCalUID')
+                    logger.info(json.dumps({
+                        "type": "DIAG_RRULE_MISMATCH",
+                        "source": source_name,
+                        "uid": uid,
+                        "iCalUID": ical,
+                        "google_event_id": g_model.google_event_id,
+                        "db_rrule": db_model.rrule,
+                        "google_rrule": g_model.rrule,
+                        "db_until": self._extract_until_from_rrule(db_model.rrule),
+                        "google_until": self._extract_until_from_rrule(g_model.rrule)
+                    }))
+        except Exception as e:
+            logger.debug(f"[SIMPLE][{source_name}] RRULE mismatch diagnostics failed: {e}")
+        google_keys = set(same_source_map.keys())
+
+        # --- Series reset planning (iCalUID-driven) for truncation/split ---
+        reset_uids: set = set()
+        create_after_reset: Dict[Tuple[str, Optional[str]], EventModel] = {}
+        try:
+            # Build raw_by_id locally for safety
+            raw_by_id = {it.get('id'): it for it in all_google_items if it.get('id')}
+
+            # CANCELLED tombstones (This event only delete/edit) referencing our current master -> reset series
+            try:
+                cancelled_map = await self.google.list_cancelled_by_source(source_name)
+                # Map current active masters by UID
+                master_gid_by_uid_tmp: Dict[str, str] = {
+                    uid: model.google_event_id
+                    for (uid, rid), model in same_source_map.items()
+                    if rid is None and model and model.google_event_id
+                }
+                for (c_uid, c_rid), raw_item in cancelled_map.items():
+                    master_gid = master_gid_by_uid_tmp.get(c_uid)
+                    if not master_gid:
+                        continue
+                    is_cancelled_master = (c_rid is None and raw_item.get('id') == master_gid)
+                    is_cancelled_instance = (c_rid is not None and raw_item.get('recurringEventId') == master_gid)
+                    if not (is_cancelled_master or is_cancelled_instance):
+                        continue
+
+                    # Disown all active items so private props don't match new tombstones
+                    disowned_c = 0
+                    masters_ids_c: List[str] = []
+                    try:
+                        items_for_uid = await self.google.list_events_for_uid(source_name, c_uid, include_cancelled=False)
+                    except Exception as e:
+                        logger.warning(f"[SIMPLE][{source_name}] list_events_for_uid failed for CANCELLED reset UID={c_uid}: {e}")
+                        items_for_uid = []
+                    for it in items_for_uid:
+                        status2 = (it.get('status') or '').upper()
+                        if status2 != 'CANCELLED':
+                            gid2 = it.get('id')
+                            if gid2:
+                                ok = await self.google.disown_event(gid2)
+                                if ok:
+                                    disowned_c += 1
+                        if it.get('recurrence') and not it.get('recurringEventId'):
+                            if it.get('id'):
+                                masters_ids_c.append(it.get('id'))
+
+                    if masters_ids_c:
+                        to_delete_ids.extend(masters_ids_c)
+
+                    reset_uids.add(c_uid)
+                    for (k_uid, k_rid), ev in desired.items():
+                        if k_uid == c_uid:
+                            create_after_reset[(k_uid, k_rid)] = ev
+
+                    try:
+                        logger.info(json.dumps({
+                            "type": "RESET_SERIES_CANCELLED_EXCEPTION",
+                            "source": source_name,
+                            "uid": c_uid,
+                            "rid": c_rid,
+                            "disowned_count": disowned_c,
+                            "masters": masters_ids_c
+                        }))
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug(f"[SIMPLE][{source_name}] cancelled-exception reset detection failed: {e}")
+
+            # Malformed owned exceptions detected during classification → reset series
+            try:
+                if malformed_owned_uids:
+                    for owner_uid in list(malformed_owned_uids):
+                        try:
+                            items_for_uid = await self.google.list_events_for_uid(source_name, owner_uid, include_cancelled=False)
+                        except Exception as e:
+                            logger.warning(f"[SIMPLE][{source_name}] list_events_for_uid failed for malformed exception UID={owner_uid}: {e}")
+                            items_for_uid = []
+                        disowned_m = 0
+                        masters_ids_m: List[str] = []
+                        for it in items_for_uid:
+                            status2 = (it.get('status') or '').upper()
+                            if status2 != 'CANCELLED':
+                                gid2 = it.get('id')
+                                if gid2:
+                                    ok = await self.google.disown_event(gid2)
+                                    if ok:
+                                        disowned_m += 1
+                            if it.get('recurrence') and not it.get('recurringEventId'):
+                                if it.get('id'):
+                                    masters_ids_m.append(it.get('id'))
+                        if masters_ids_m:
+                            to_delete_ids.extend(masters_ids_m)
+                        reset_uids.add(owner_uid)
+                        for (k_uid, k_rid), ev in desired.items():
+                            if k_uid == owner_uid:
+                                create_after_reset[(k_uid, k_rid)] = ev
+                        try:
+                            logger.info(json.dumps({
+                                "type": "RESET_SERIES_MALFORMED_EXCEPTION",
+                                "source": source_name,
+                                "uid": owner_uid,
+                                "disowned_count": disowned_m,
+                                "masters": masters_ids_m
+                            }))
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.debug(f"[SIMPLE][{source_name}] malformed-owned-exception reset handling failed: {e}")
+
+            # Duplicate masters by iCalUID (any ownership) -> unconditional reset
+            masters_by_ical_all: Dict[str, List[Dict[str, Any]]] = {}
+            for it in all_google_items:
+                status = (it.get('status') or '').upper()
+                if status == 'CANCELLED':
+                    continue
+                if (it.get('recurrence') and not it.get('recurringEventId')):
+                    ical = it.get('iCalUID')
+                    if ical:
+                        masters_by_ical_all.setdefault(ical, []).append(it)
+            for ical, masters in masters_by_ical_all.items():
+                if len(masters) >= 2:
+                    # Find owned item to determine DB uid
+                    owner_uid = None
+                    for m in masters:
+                        private = ((m.get('extendedProperties') or {}).get('private')) or {}
+                        if private.get('caldav-mirror-source') == source_name:
+                            owner_uid = private.get('caldav-mirror-uid')
+                            break
+                    if not owner_uid:
+                        continue
+                    try:
+                        items_by_ical = await self.google.list_events_by_icaluid(ical, include_cancelled=True)
+                    except Exception as e:
+                        logger.warning(f"[SIMPLE][{source_name}] list_events_by_icaluid failed for iCalUID={ical}: {e}")
+                        items_by_ical = []
+                    # Disown our active items
+                    disowned = 0
+                    for it2 in items_by_ical:
+                        status2 = (it2.get('status') or '').upper()
+                        if status2 == 'CANCELLED':
+                            continue
+                        private2 = ((it2.get('extendedProperties') or {}).get('private')) or {}
+                        if private2.get('caldav-mirror-source') == source_name and it2.get('id'):
+                            ok = await self.google.disown_event(it2.get('id'))
+                            if ok:
+                                disowned += 1
+                    # Delete all masters in group
+                    masters_ids = [it2.get('id') for it2 in items_by_ical if it2.get('id') and (it2.get('recurrence') and not it2.get('recurringEventId'))]
+                    if masters_ids:
+                        to_delete_ids.extend(masters_ids)
+                    logger.info(json.dumps({"type": "RESET_SERIES_DUPLICATE_MASTERS", "source": source_name, "uid": owner_uid, "iCalUID": ical, "masters": masters_ids, "disowned_count": disowned, "total_masters": len(masters)}))
+                    # Schedule DB recreate
+                    reset_uids.add(owner_uid)
+                    for (k_uid, k_rid), ev in desired.items():
+                        if k_uid == owner_uid:
+                            create_after_reset[(k_uid, k_rid)] = ev
+
+            # Duplicate masters by our UID (owned) -> unconditional reset
+            try:
+                # Check for multiple owned masters within the same UID regardless of iCalUID
+                for owner_uid, g_model in masters_by_uid_google.items():
+                    try:
+                        items_for_uid = await self.google.list_events_for_uid(source_name, owner_uid, include_cancelled=False)
+                    except Exception as e:
+                        logger.warning(f"[SIMPLE][{source_name}] list_events_for_uid failed for UID={owner_uid}: {e}")
+                        items_for_uid = []
+                    master_ids = [it.get('id') for it in items_for_uid if it.get('id') and (it.get('recurrence') and not it.get('recurringEventId'))]
+                    if len(master_ids) >= 2:
+                        # Disown active items for this UID
+                        disowned2 = 0
+                        for it in items_for_uid:
+                            status2 = (it.get('status') or '').upper()
+                            if status2 == 'CANCELLED':
+                                continue
+                            gid2 = it.get('id')
+                            if not gid2:
+                                continue
+                            ok = await self.google.disown_event(gid2)
+                            if ok:
+                                disowned2 += 1
+                        # Delete all masters we found (both)
+                        to_delete_ids.extend(master_ids)
+                        logger.info(json.dumps({"type": "RESET_SERIES_DUPLICATE_BY_UID", "source": source_name, "uid": owner_uid, "masters": master_ids, "disowned_count": disowned2}))
+                        reset_uids.add(owner_uid)
+                        for (k_uid, k_rid), ev in desired.items():
+                            if k_uid == owner_uid:
+                                create_after_reset[(k_uid, k_rid)] = ev
+            except Exception as e:
+                logger.warning(f"[SIMPLE][{source_name}] UID-duplicate reset planning failed: {e}")
+
+            # --- Unauthorized single-instance modifications ("This event only") ---
+            # Case A: Owned exception exists in Google but not in DB → reset whole series.
+            extra_owned_keys = google_keys - desired_keys
+            for (ex_uid, ex_rid) in list(extra_owned_keys):
+                if ex_rid is None:
+                    continue  # masters handled elsewhere
+                if (ex_uid, None) not in desired_keys:
+                    continue  # not a series we manage
+                try:
+                    items_for_uid = await self.google.list_events_for_uid(source_name, ex_uid, include_cancelled=False)
+                except Exception as e:
+                    logger.warning(f"[SIMPLE][{source_name}] list_events_for_uid failed for unauthorized exception UID={ex_uid}: {e}")
+                    items_for_uid = []
+                # Disown all active items to prevent privateExtendedProperty being carried to tombstones
+                disowned_ex = 0
+                masters_ids_ex = []
+                for it in items_for_uid:
+                    status2 = (it.get('status') or '').upper()
+                    if status2 != 'CANCELLED':
+                        gid2 = it.get('id')
+                        if gid2:
+                            ok = await self.google.disown_event(gid2)
+                            if ok:
+                                disowned_ex += 1
+                    # Collect masters to delete
+                    if it.get('recurrence') and not it.get('recurringEventId'):
+                        if it.get('id'):
+                            masters_ids_ex.append(it.get('id'))
+                if masters_ids_ex:
+                    to_delete_ids.extend(masters_ids_ex)
+                reset_uids.add(ex_uid)
+                for (k_uid, k_rid), ev in desired.items():
+                    if k_uid == ex_uid:
+                        create_after_reset[(k_uid, k_rid)] = ev
+                try:
+                    logger.info(json.dumps({
+                        "type": "RESET_SERIES_UNAUTHORIZED_EXCEPTION",
+                        "source": source_name,
+                        "uid": ex_uid,
+                        "rid": ex_rid,
+                        "disowned_count": disowned_ex,
+                        "masters": masters_ids_ex
+                    }))
+                except Exception:
+                    pass
+
+            # Case B: Unmanaged exception (no private props) pointing at our master → reset the owner series.
+            try:
+                master_gid_by_uid_tmp: Dict[str, str] = {
+                    uid: model.google_event_id
+                    for (uid, rid), model in same_source_map.items()
+                    if rid is None and model and model.google_event_id
+                }
+                # Scan all items; if an item has recurringEventId matching one of our masters but lacks our ownership, reset.
+                for it in all_google_items:
+                    status = (it.get('status') or '').upper()
+                    if status == 'CANCELLED':
+                        continue
+                    rec_id = it.get('recurringEventId')
+                    private = ((it.get('extendedProperties') or {}).get('private')) or {}
+                    item_source = private.get('caldav-mirror-source')
+                    if not rec_id:
+                        continue
+                    # Find which UID this rec_id belongs to
+                    owner_uid = None
+                    for u, gid in master_gid_by_uid_tmp.items():
+                        if gid and rec_id == gid:
+                            owner_uid = u
+                            break
+                    if not owner_uid:
+                        continue
+                    if item_source == source_name:
+                        # It's ours; this case is covered by extra_owned_keys above
+                        continue
+                    # Unmanaged exception pointing at our master -> reset owner_uid
+                    try:
+                        items_for_uid = await self.google.list_events_for_uid(source_name, owner_uid, include_cancelled=False)
+                    except Exception as e:
+                        logger.warning(f"[SIMPLE][{source_name}] list_events_for_uid failed for unmanaged exception UID={owner_uid}: {e}")
+                        items_for_uid = []
+                    disowned_ex2 = 0
+                    masters_ids_ex2 = []
+                    for it2 in items_for_uid:
+                        status2 = (it2.get('status') or '').upper()
+                        if status2 != 'CANCELLED':
+                            gid2 = it2.get('id')
+                            if gid2:
+                                ok = await self.google.disown_event(gid2)
+                                if ok:
+                                    disowned_ex2 += 1
+                        if it2.get('recurrence') and not it2.get('recurringEventId'):
+                            if it2.get('id'):
+                                masters_ids_ex2.append(it2.get('id'))
+                    if masters_ids_ex2:
+                        to_delete_ids.extend(masters_ids_ex2)
+                    reset_uids.add(owner_uid)
+                    for (k_uid, k_rid), ev in desired.items():
+                        if k_uid == owner_uid:
+                            create_after_reset[(k_uid, k_rid)] = ev
+                    try:
+                        logger.info(json.dumps({
+                            "type": "RESET_SERIES_UNMANAGED_EXCEPTION",
+                            "source": source_name,
+                            "uid": owner_uid,
+                            "recurringEventId": rec_id,
+                            "disowned_count": disowned_ex2,
+                            "masters": masters_ids_ex2
+                        }))
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug(f"[SIMPLE][{source_name}] unmanaged-exception reset detection failed: {e}")
+
+            # Recompute masters maps
+            masters_by_uid_db = {uid: model for (uid, rid), model in desired.items() if rid is None}
+            masters_by_uid_google = {uid: model for (uid, rid), model in same_source_map.items() if rid is None}
+
+            # Canonical RRULE mismatch → candidate for reset (typically Google added UNTIL)
+            for uid, g_model in masters_by_uid_google.items():
+                db_model = masters_by_uid_db.get(uid)
+                if not db_model:
+                    continue
+                db_rr_can = self._canon_rrule_str(db_model.rrule)
+                g_rr_can = self._canon_rrule_str(g_model.rrule)
+                if db_rr_can != g_rr_can:
+                    # Resolve iCalUID of the owned master
+                    raw = raw_by_id.get(g_model.google_event_id)
+                    ical = (raw or {}).get('iCalUID')
+                    if not ical:
+                        continue
+
+                    # Fetch entire group by iCalUID (captures successor masters lacking our private props)
+                    try:
+                        items_by_ical = await self.google.list_events_by_icaluid(ical, include_cancelled=True)
+                    except Exception as e:
+                        logger.warning(f"[SIMPLE][{source_name}] list_events_by_icaluid failed for iCalUID={ical}: {e}")
+                        items_by_ical = []
+
+                    # Disown our active items for this series to prevent privateExtendedProperty-based matches on tombstones
+                    disowned = 0
+                    for it in items_by_ical:
+                        status = (it.get('status') or '').upper()
+                        if status == 'CANCELLED':
+                            continue
+                        private = ((it.get('extendedProperties') or {}).get('private')) or {}
+                        if private.get('caldav-mirror-source') == source_name and it.get('id'):
+                            ok = await self.google.disown_event(it.get('id'))
+                            if ok:
+                                disowned += 1
+                    logger.info(json.dumps({"type": "RESET_SERIES_PREP", "source": source_name, "uid": uid, "iCalUID": ical, "disowned_count": disowned}))
+
+                    # Delete ALL masters for this iCalUID (R1 and any R2)
+                    masters_ids = [it.get('id') for it in items_by_ical if it.get('id') and (it.get('recurrence') and not it.get('recurringEventId'))]
+                    if masters_ids:
+                        to_delete_ids.extend(masters_ids)
+                        logger.info(json.dumps({"type": "RESET_SERIES_DELETE_MASTERS", "source": source_name, "uid": uid, "iCalUID": ical, "masters": masters_ids}))
+
+                    # Mark UID for reset and queue full re-create from DB after deletion
+                    reset_uids.add(uid)
+                    for (k_uid, k_rid), ev in desired.items():
+                        if k_uid == uid:
+                            create_after_reset[(k_uid, k_rid)] = ev
+        except Exception as e:
+            logger.warning(f"[SIMPLE][{source_name}] reset planning failed: {e}")
+
+        # 3) Compute reconciliation sets for this source
+        keys_to_create = desired_keys - google_keys
+        keys_to_update = desired_keys & google_keys
+        extra_google_keys = google_keys - desired_keys  # ours on Google but not in DB => delete
+
+        # 3a) Queue deletes for "extra" same-source events
+        for key in extra_google_keys:
+            gid = same_source_map[key].google_event_id
+            if gid:
+                to_delete_ids.append(gid)
+
+        # 3b) Prepare update list (ensure exception hash parity by populating recurringEventId on desired)
+        to_update: List[Tuple[str, EventModel]] = []
+        master_gid_by_uid: Dict[str, str] = {
+            uid: model.google_event_id
+            for (uid, rid), model in same_source_map.items()
+            if rid is None and model and model.google_event_id
+        }
+
+        for key in keys_to_update:
+            db_model = desired[key]
+            g_model = same_source_map[key]
+
+            # Ensure DB exception models carry master recurringEventId prior to hashing
+            if db_model.recurrence_id and not db_model.google_recurring_event_id:
+                master_id = master_gid_by_uid.get(db_model.uid)
+                if master_id:
+                    db_model.google_recurring_event_id = master_id
+
+            if db_model.compute_hash() != g_model.compute_hash():
+                db_model.google_event_id = g_model.google_event_id
+                to_update.append((g_model.google_event_id, db_model))
+
+        # Drop updates for series scheduled for reset
+        try:
+            if reset_uids:
+                before = len(to_update)
+                to_update = [(gid, e) for (gid, e) in to_update if e.uid not in reset_uids]
+                logger.info(json.dumps({"type": "RESET_SERIES_FILTER_UPDATES", "source": source_name, "removed": before - len(to_update), "remaining": len(to_update)}))
+        except NameError:
+            # reset_uids not defined
+            pass
+
+        # 3c) Prepare create lists
+        to_create: List[EventModel] = [desired[k] for k in keys_to_create]
+        # Add full series to create for any series scheduled for reset, and de-duplicate
+        try:
+            if create_after_reset:
+                merge_map: Dict[Tuple[str, Optional[str]], EventModel] = {(e.uid, e.recurrence_id): e for e in to_create}
+                for key, ev in create_after_reset.items():
+                    merge_map[key] = ev
+                to_create = list(merge_map.values())
+                logger.info(json.dumps({"type": "RESET_SERIES_ADD_CREATES", "source": source_name, "added": len(create_after_reset)}))
+        except NameError:
+            # create_after_reset not defined
+            pass
+
+        # Partition by primary vs exceptions
+        primary_to_create: List[EventModel] = [e for e in to_create if not e.recurrence_id]
+        exceptions_to_create: List[EventModel] = [e for e in to_create if e.recurrence_id]
+        primary_to_update: List[Tuple[str, EventModel]] = [(gid, e) for (gid, e) in to_update if not e.recurrence_id]
+        exceptions_to_update: List[Tuple[str, EventModel]] = [(gid, e) for (gid, e) in to_update if e.recurrence_id]
+
+        # 4) Execute plan (Delete -> Update primary -> Create primary -> Update exceptions -> Create exceptions)
+
+        # 4.1) Deletes (dedup to avoid batch errors)
+        if to_delete_ids:
+            dedup_delete = list(dict.fromkeys(to_delete_ids))
+            logger.info(f"[SIMPLE][{source_name}] Deleting {len(dedup_delete)} Google events (unmanaged + extra).")
+            await self.google.batch_delete_events(dedup_delete)
+
+        # 4.2) Update primary
+        if primary_to_update:
+            logger.info(f"[SIMPLE][{source_name}] Updating {len(primary_to_update)} primary events.")
+            await self.google.batch_update_events(primary_to_update)
+
+        # 4.3) Create primary
+        created_map: Dict[Tuple[str, Optional[str]], str] = {}
+        if primary_to_create:
+            logger.info(f"[SIMPLE][{source_name}] Creating {len(primary_to_create)} primary events.")
+            created_map = await self.google.batch_create_events(primary_to_create)
+            if created_map:
+                await self.db.bulk_update_google_ids(source_name, created_map)
+                # Extend master map with newly created masters
+                for (uid, rid), gid in created_map.items():
+                    if rid is None:
+                        master_gid_by_uid[uid] = gid
+
+        # 4.4) Update exceptions
+        if exceptions_to_update:
+            logger.info(f"[SIMPLE][{source_name}] Updating {len(exceptions_to_update)} exceptions.")
+            await self.google.batch_update_events(exceptions_to_update)
+
+        # 4.5) Create exceptions (after masters exist; set recurringEventId)
+        if exceptions_to_create:
+            valid_exceptions: List[EventModel] = []
+            for ex in exceptions_to_create:
+                master_id = ex.google_recurring_event_id or master_gid_by_uid.get(ex.uid)
+                if master_id:
+                    ex.google_recurring_event_id = master_id
+                    valid_exceptions.append(ex)
+                else:
+                    logger.error(f"[SIMPLE][{source_name}] Cannot resolve master Google ID for exception {ex.uid}/{ex.recurrence_id}. Skipping creation.")
+            if valid_exceptions:
+                created_ex_map = await self.google.batch_create_events(valid_exceptions)
+                if created_ex_map:
+                    await self.db.bulk_update_google_ids(source_name, created_ex_map)
+
+        logger.info(f"[SIMPLE] Reconciliation finished for source '{source_name}'")

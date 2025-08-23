@@ -114,6 +114,20 @@ async def main():
             sys.exit(1)
         logger.info("Successfully authenticated with Google.")
 
+        # 3.5 Enforce dedicated empty calendar on first run
+        try:
+            total_db_events = await db.count_events()
+        except Exception:
+            total_db_events = 0
+        if total_db_events == 0:
+            is_empty = await google_client.is_calendar_empty()
+            if not is_empty:
+                logger.error(
+                    "The destination Google Calendar is not empty. This application requires a dedicated, empty "
+                    "calendar that it exclusively manages. To proceed, either clear ALL events from the selected "
+                    "calendar or provide a different, empty calendar ID in GOOGLE_CALENDAR_ID. Exiting without making changes."
+                )
+                sys.exit(2)
         # 4. Initialize CalDAV Clients
         caldav_clients = []
         for source_config in config["sources"]:
