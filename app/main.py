@@ -11,6 +11,7 @@ import logging
 import sys
 import os
 import yaml
+import json
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Dict, Any, List
@@ -114,12 +115,37 @@ async def main():
             sys.exit(1)
         logger.info("Successfully authenticated with Google.")
 
-        # 3.5 Enforce dedicated empty calendar on first run
+        # 3.5 Enforce dedicated empty calendar ONLY on true first run (fresh DB) or when destination calendar has changed
         try:
             total_db_events = await db.count_events()
         except Exception:
             total_db_events = 0
-        if total_db_events == 0:
+        try:
+            total_sync_states = await db.count_sync_states()
+        except Exception:
+            total_sync_states = 0
+        try:
+            stored_calendar_id = await db.get_app_state("google_calendar_id")
+        except Exception:
+            stored_calendar_id = None
+
+        is_new_database = (total_db_events == 0 and total_sync_states == 0)
+        calendar_changed = (stored_calendar_id is not None and stored_calendar_id != config["google_calendar_id"])
+        first_run_guard_needed = is_new_database or calendar_changed
+
+        # Diagnostics for startup guard decision
+        logger.info(json.dumps({
+            "type": "STARTUP_GUARD",
+            "db_events": total_db_events,
+            "sync_states": total_sync_states,
+            "stored_calendar_id": stored_calendar_id,
+            "current_calendar_id": config["google_calendar_id"],
+            "is_new_database": is_new_database,
+            "calendar_changed": calendar_changed,
+            "enforce_empty_calendar": first_run_guard_needed
+        }))
+
+        if first_run_guard_needed:
             is_empty = await google_client.is_calendar_empty()
             if not is_empty:
                 logger.error(
@@ -128,6 +154,14 @@ async def main():
                     "calendar or provide a different, empty calendar ID in GOOGLE_CALENDAR_ID. Exiting without making changes."
                 )
                 sys.exit(2)
+        else:
+            logger.info("Skipping empty-calendar enforcement (database already initialized and calendar unchanged).")
+
+        # Persist the current calendar id for future runs (best-effort)
+        try:
+            await db.set_app_state("google_calendar_id", config["google_calendar_id"])
+        except Exception as e:
+            logger.debug(f"Failed to persist google_calendar_id to app_state: {e}")
         # 4. Initialize CalDAV Clients
         caldav_clients = []
         for source_config in config["sources"]:

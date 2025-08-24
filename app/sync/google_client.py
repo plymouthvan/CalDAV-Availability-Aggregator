@@ -483,15 +483,28 @@ class GoogleClient:
             return None
     async def is_calendar_empty(self) -> bool:
         """
-        Return True if the destination Google Calendar has no active events.
-        Used for enforcing the dedicated, empty calendar requirement on first run.
+        Return True if the destination Google Calendar has no active (non-deleted) events.
+        Ignores CANCELLED tombstones and emits diagnostics for confirmation.
         """
-        logger.info("Checking if Google Calendar is empty...")
+        logger.info("Checking if Google Calendar is empty (active events only, full scan)...")
         try:
-            # showDeleted defaults to false in _list_events_paginated when not provided
-            items = await self._list_events_paginated({'maxResults': 1})
-            empty = len(items) == 0
-            logger.info(f"Calendar empty: {empty}")
+            # Perform a definitive active-only scan. This excludes CANCELLED tombstones by design.
+            items_active = await self.list_all_events_active()
+            empty = len(items_active) == 0
+
+            # Emit structured diagnostics with a small sample of IDs
+            try:
+                logger.info(json.dumps({
+                    "type": "CALENDAR_EMPTY_CHECK",
+                    "calendar_id": self.calendar_id,
+                    "method": "full_active_scan",
+                    "active_count": len(items_active),
+                    "decision_empty": empty,
+                    "active_sample_ids": [it.get('id') for it in items_active[:3]]
+                }))
+            except Exception:
+                pass
+
             return empty
         except Exception as e:
             logger.error(f"Failed to check calendar emptiness: {e}", exc_info=True)

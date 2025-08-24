@@ -76,6 +76,15 @@ class Database:
             )
         """)
         
+        # App state table - stores simple key/value app metadata (e.g., last used calendar_id)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         # Create indexes for performance
         await db.execute("CREATE INDEX IF NOT EXISTS idx_events_source ON events(source_name)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_events_caldav_uid ON events(caldav_uid)")
@@ -340,16 +349,42 @@ class Database:
         """Get encrypted authentication token."""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
-                SELECT encrypted_token FROM auth_tokens 
+                SELECT encrypted_token FROM auth_tokens
                 WHERE service = ?
             """, (service,))
             
             row = await cursor.fetchone()
             return row[0] if row else None
 
+    async def get_app_state(self, key: str) -> Optional[str]:
+        """Get a simple app-level state value (e.g., last used Google Calendar ID)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT value FROM app_state WHERE key = ?", (key,))
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+    async def set_app_state(self, key: str, value: str):
+        """Set a simple app-level state value."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO app_state (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (key, value))
+            await db.commit()
+
     async def count_events(self) -> int:
         """Return the total number of event instances stored across all sources."""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM events")
+            row = await cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    async def count_sync_states(self) -> int:
+        """Return the number of rows in sync_state (used to infer prior initialization)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM sync_state")
             row = await cursor.fetchone()
             return int(row[0]) if row and row[0] is not None else 0
