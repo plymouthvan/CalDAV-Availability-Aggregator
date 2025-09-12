@@ -84,12 +84,24 @@ class Database:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Projection state - window bounds + fingerprint for skip gating
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS projection_state (
+                source_name TEXT PRIMARY KEY,
+                window_start_utc TEXT NOT NULL,
+                window_end_utc TEXT NOT NULL,
+                window_fingerprint TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         
         # Create indexes for performance
         await db.execute("CREATE INDEX IF NOT EXISTS idx_events_source ON events(source_name)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_events_caldav_uid ON events(caldav_uid)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_events_google_id ON events(google_event_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_events_hash ON events(event_hash)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_projection_updated_at ON projection_state(updated_at)")
     
     async def store_event(self, source_name: str, caldav_uid: str, recurrence_id: Optional[str],
                           event_data: Dict[str, Any], event_hash: str, is_master_event: bool,
@@ -332,6 +344,44 @@ class Database:
                     'last_sync': row[4]
                 }
         return None
+
+    # --- Projection Window Fingerprint State ---
+
+    async def get_projection_state(self, source_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Return the last stored projection window state for this source, or None.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                SELECT window_start_utc, window_end_utc, window_fingerprint, updated_at
+                FROM projection_state
+                WHERE source_name = ?
+            """, (source_name,))
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "window_start_utc": row[0],
+                "window_end_utc": row[1],
+                "window_fingerprint": row[2],
+                "updated_at": row[3],
+            }
+
+    async def set_projection_state(self, source_name: str, window_start_utc: str, window_end_utc: str, window_fingerprint: str) -> None:
+        """
+        Upsert the projection window fingerprint for a source.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO projection_state (source_name, window_start_utc, window_end_utc, window_fingerprint, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(source_name) DO UPDATE SET
+                    window_start_utc = excluded.window_start_utc,
+                    window_end_utc = excluded.window_end_utc,
+                    window_fingerprint = excluded.window_fingerprint,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (source_name, window_start_utc, window_end_utc, window_fingerprint))
+            await db.commit()
     
     async def store_auth_token(self, service: str, encrypted_token: str, 
                               expires_at: Optional[datetime] = None):

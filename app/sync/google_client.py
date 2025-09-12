@@ -448,7 +448,6 @@ class GoogleClient:
             'orderBy': "startTime" if single_events else None,
             'showDeleted': "false",
             'maxResults': 2500,
-            'maxAttendees': 0,
             'fields': 'items(id,iCalUID,recurringEventId,originalStartTime,recurrence,status,start,end,summary,extendedProperties/private),nextPageToken',
         }
         items = await self._list_events_paginated(params)
@@ -727,3 +726,119 @@ class GoogleClient:
         except Exception as e:
             logger.error(f"Error in batch delete: {e}", exc_info=True)
             return False
+    async def list_owned_events_in_window(self, source_name: str, time_min: str, time_max: str) -> Tuple[Dict[Tuple[str, Optional[str]], EventModel], Dict[Tuple[str, Optional[str]], Dict[str, Any]]]:
+        """
+        Return our owned events within a window, keyed by (uid, recurrence_id).
+
+        Filters by extendedProperties.private.caldav-mirror-source == source_name and status != CANCELLED.
+        """
+        items = await self.list_events_window(time_min, time_max, single_events=True)
+        models: Dict[Tuple[str, Optional[str]], EventModel] = {}
+        raws: Dict[Tuple[str, Optional[str]], Dict[str, Any]] = {}
+        for it in items:
+            status = (it.get('status') or '').upper()
+            if status == 'CANCELLED':
+                continue
+            private = ((it.get('extendedProperties') or {}).get('private')) or {}
+            if private.get('caldav-mirror-source') != source_name:
+                continue
+            model = EventModel.from_google_event(it)
+            if not model or not model.uid:
+                continue
+            key = (model.uid, model.recurrence_id)
+            models[key] = model
+            raws[key] = it
+        return models, raws
+
+    async def fetch_next_sync_token(self) -> Optional[str]:
+        """
+        Perform a full incremental baseline scan to obtain nextSyncToken for the calendar.
+        This is a lightweight scan (fields limited). Returns the token or None.
+        """
+        url = f"{self.API_BASE_URL}/calendars/{self.calendar_id}/events"
+        headers = await self._get_auth_headers()
+        params: Dict[str, Any] = {
+            'showDeleted': "true",
+            'maxResults': 2500,
+            # Limit fields for speed: only need pagination + token + minimal items
+            'fields': 'nextPageToken,nextSyncToken,items/id'
+        }
+
+        next_page = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                while True:
+                    if next_page:
+                        params['pageToken'] = next_page
+                    async with session.get(url, headers=headers, params=params) as resp:
+                        if resp.status != 200:
+                            txt = await resp.text()
+                            logger.error(f"fetch_next_sync_token failed: {resp.status} - {txt}")
+                            return None
+                        data = await resp.json()
+                        next_page = data.get('nextPageToken')
+                        if not next_page:
+                            return data.get('nextSyncToken')
+        except Exception as e:
+            logger.error(f"Error in fetch_next_sync_token: {e}", exc_info=True)
+            return None
+
+    async def has_changes_since(self, sync_token: str) -> Tuple[bool, Optional[str]]:
+        """
+        Check whether there are any changes since the provided sync token.
+
+        Returns:
+            (changed, next_sync_token or None if token invalid/expired)
+        """
+        url = f"{self.API_BASE_URL}/calendars/{self.calendar_id}/events"
+        headers = await self._get_auth_headers()
+        params: Dict[str, Any] = {
+            'syncToken': sync_token,
+            'showDeleted': "true",
+            'maxResults': 2500,
+            'fields': 'nextPageToken,nextSyncToken,items/id,items/status'
+        }
+
+        next_page = None
+        any_items = False
+        try:
+            async with aiohttp.ClientSession() as session:
+                while True:
+                    if next_page:
+                        params['pageToken'] = next_page
+                    async with session.get(url, headers=headers, params=params) as resp:
+                        if resp.status == 410:
+                            # Token too old/invalid
+                            logger.info("Google sync token expired (410). Full baseline required.")
+                            return True, None
+                        if resp.status != 200:
+                            txt = await resp.text()
+                            logger.error(f"has_changes_since failed: {resp.status} - {txt}")
+                            # Be conservative: assume changes
+                            return True, None
+                        data = await resp.json()
+                        items = data.get('items', [])
+                        if items:
+                            any_items = True
+                        next_page = data.get('nextPageToken')
+                        if not next_page:
+                            return any_items, data.get('nextSyncToken')
+        except Exception as e:
+            logger.error(f"Error in has_changes_since: {e}", exc_info=True)
+            # Be conservative: assume changes
+            return True, None
+
+
+    async def list_all_owned_events_raw(self, source_name: str) -> List[Dict[str, Any]]:
+        """
+        List all ACTIVE events owned by this source across the entire calendar, without grouping/dedup.
+        Useful for garbage-collecting out-of-window instances in the flattened projection model.
+        """
+        params: Dict[str, Any] = {
+            'privateExtendedProperty': f"caldav-mirror-source={source_name}",
+            'maxResults': 2500,
+            'showDeleted': "false",
+            'fields': 'items(id,recurrence,recurringEventId,status,start,end,extendedProperties/private),nextPageToken'
+        }
+        items = await self._list_events_paginated(params)
+        return items

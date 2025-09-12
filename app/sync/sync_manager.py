@@ -13,7 +13,7 @@ from database import Database
 from .caldav_client import CalDAVClient
 from .google_client import GoogleClient
 from .event_model import EventModel
-from .reconciler import Reconciler
+from .window_reconciler import WindowReconciler
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ class SyncManager:
         self.google = google_client
         self.db = database
         self.source_name = caldav_client.name
-        self.reconciler = Reconciler(google_client, database)
+        self.window_reconciler = WindowReconciler(google_client, database)
 
     async def run_sync(self):
         """
@@ -112,8 +112,8 @@ class SyncManager:
                             google_recurring_event_id=event.google_recurring_event_id
                         )
 
-            # 4. Trigger the reconciliation process (simplified, dedicated calendar model)
-            await self.reconciler.reconcile_source_simple(self.source_name)
+            # 4. Trigger the windowed, flattened-instance reconciliation
+            await self.window_reconciler.reconcile_window(self.source_name)
 
             # 5. Update sync state
             if new_sync_state:

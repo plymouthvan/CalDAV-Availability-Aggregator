@@ -173,3 +173,99 @@ docker compose -f docker/docker-compose.yml run --rm --entrypoint python3 caldav
 ## 💬 License
 
 MIT. Use it, fork it, build something weird with it.
+## 🧭 Windowed Projection Architecture (Flattened Instances)
+
+This service now treats Google Calendar as a cache of explicitly projected instances over a rolling time window. Instead of mirroring recurrence semantics (RRULE/EXDATE) on Google, each occurrence is created as a standalone event. This eliminates “this and future” splits, EXDATE reconciliation, and other edge cases. Reconciliation becomes pure set arithmetic.
+
+Key properties:
+- Deterministic and idempotent: re-running a cycle with no changes produces zero operations.
+- Instance-level hashing: each projected instance carries a fingerprint to detect changes reliably.
+- Ownership tagging: events are tagged in extendedProperties.private so we only touch what we own.
+
+What goes to Google per event instance:
+- extendedProperties.private
+  - caldav-mirror-source: source name
+  - caldav-mirror-uid: CalDAV UID
+  - caldav-mirror-instance-key: stable instance key (uid + effective start/end)
+  - caldav-mirror-hash: projected content hash
+  - caldav-mirror-version: “flat-1”
+
+No recurringEventId, no recurrence arrays are used for new events in this model.
+
+## 🪟 Rolling Window Configuration (ENV, hot-reloaded)
+
+These environment variables control how far back and forward we project instances. They are read every sync cycle (no restart required):
+
+- PROJECTION_WINDOW_PAST_DAYS (default: 30)
+- PROJECTION_WINDOW_FUTURE_MONTHS (default: 18)
+- PROJECTION_DRY_RUN (default: false)
+
+Safety clamps:
+- PROJECTION_WINDOW_PAST_DAYS is clamped to [0, 3650]
+- PROJECTION_WINDOW_FUTURE_MONTHS is clamped to [0, 60]
+
+Effects:
+- Widening the window adds newly in-range historical/future instances
+- Shrinking the window triggers garbage collection of out-of-window owned instances
+
+## ⚙️ Skip Gating and Fingerprinting
+
+To minimize API calls, each cycle can be skipped when both conditions are met:
+- Google reports no changes since last syncToken (incremental delta)
+- The local desired window fingerprint hasn’t changed for this source
+
+If the syncToken expires (410), we automatically compute a new baseline token and continue.
+
+## 🔎 Observability (Structured Logs)
+
+During projection, several structured log objects are emitted to aid debugging:
+- type: WINDOW_SKIP_GATE — skip decision and input conditions
+- type: PROJECTION_PLAN — counts of desired/owned keys, creates, deletes
+- type: PROJECTION_DRY_RUN — dry-run plan (no mutations)
+- type: PROJECTION_DRY_RUN_SKIPPED_STATE — indicates state persistence is skipped in dry-run
+
+You can set PROJECTION_DRY_RUN=true to preview actions safely.
+
+## 🧪 Behavioral Summary (Set Arithmetic)
+
+Within the [window_start, window_end) UTC:
+- Create: instances that should exist (from DB) but do not in Google
+- Delete: owned Google events that should not exist (rogue or out-of-window)
+- Replace: owned Google instances whose projected hash differs (delete + create)
+
+Running the same inputs twice yields zero operations on the second run.
+
+## 🚚 Migration Plan (from recurrence-mirroring)
+
+1) Prepare a dedicated calendar (empty, exclusive) as before.
+2) Enable dry-run:
+   - Set PROJECTION_DRY_RUN=true
+   - Let the service run at least one full cycle
+   - Inspect logs for PROJECTION_PLAN and PROJECTION_DRY_RUN entries (creates/deletes)
+3) Cutover:
+   - Set PROJECTION_DRY_RUN=false
+   - Allow one or more cycles to complete
+   - Legacy recurring masters we own will be deleted and replaced with flattened instances
+4) Adjust window as needed:
+   - Widen to backfill history/future
+   - Shrink to prune old, out-of-window instances (automatic GC)
+5) Steady state:
+   - Sync gating via syncToken + fingerprint should skip most cycles when nothing changes
+
+## 🧾 Additional .env Settings
+
+In addition to the existing .env keys (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ENCRYPTION_KEY, GOOGLE_CALENDAR_ID, DATABASE_PATH, SYNC_INTERVAL_SECONDS), add the following optional tuning parameters:
+
+# Rolling window sizing
+PROJECTION_WINDOW_PAST_DAYS=30
+PROJECTION_WINDOW_FUTURE_MONTHS=18
+
+# Preview mode (no mutations to Google, no state persisted)
+PROJECTION_DRY_RUN=false
+
+## ❗ Notes and Guarantees
+
+- Determinism: projection is derived entirely from your CalDAV data and the configured window.
+- Idempotency: identical inputs produce identical outputs; second run with no changes results in zero operations.
+- Ownership: only events carrying our private ownership marker are considered for delete/replace; anything else is treated as unmanaged and removed in dedicated-calendar mode.
+- Hot-Reload: changing PROJECTION_* env vars takes effect on the next cycle without restart.
