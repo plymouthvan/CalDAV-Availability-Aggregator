@@ -1,9 +1,9 @@
 
 
 
-# CalDAV Mirror
+# CalDAV Availability Aggregator
 
-CalDAV Mirror is a headless background service that aggregates events from one or more CalDAV calendars and mirrors them into a single Google Calendar. It is designed to be deployed via Docker, configured declaratively, and run continuously with minimal human interaction — ideal for self-hosters, power users, and future-you.
+This is a headless background service that aggregates events from one or more CalDAV calendars into a single Google Calendar for the purpose of creating an availability 'source of truth' calendar for use in applications such as Cal.com, Calendly, Latepoint, etc. It is designed to be deployed via Docker, configured declaratively, and run continuously with minimal human interaction — ideal for self-hosters, power users, and future-you.
 
 ## 🔧 What It Does
 
@@ -16,10 +16,10 @@ CalDAV Mirror is a headless background service that aggregates events from one o
 ## 💡 Philosophy
 
 - Dedicated destination calendar required (empty and exclusively managed by this service)
-- The internal database is the single source of truth; Google Calendar is a mirror
+- The internal database is the single source of truth; Google Calendar is a cache of the DB
 - CalDAV sources are authoritative; edits on Google are reverted or deleted
 - One-way sync (CalDAV → Google)
-- No UI. No surprises. Just logs and YAML.
+- No UI. No surprises (probably). Just logs and YAML.
 
 ## 📦 Installation
 
@@ -99,6 +99,7 @@ Startup will fail if this file is missing or malformed.
    - Update any differing Google event to match DB
    - Delete any Google event that is not present in the DB (including user-created or split recurring series)
 5. Changes made directly on the destination calendar are removed on the next sync
+6. Recurring events found on the source calendars will be realized and created on the Google calendar as unqiue events, not true 'recurring' events. The result should be the same for an availalability source of truth.
 
 ## ⚠️ Dedicated Calendar Requirement & Data Loss Warning
 
@@ -122,13 +123,6 @@ SQLite is used for persistence. All synced events are stored with:
 - Hash of normalized data
 - Last sync timestamps
 - Google event ID
-
-## 🚫 Not Included
-
-- No web UI
-- No config API
-- No calendar browsing
-- No two-way sync
 
 ## 🛠️ Tools
 
@@ -170,9 +164,6 @@ This tool will remove all event data from the local database. This is useful for
 docker compose -f docker/docker-compose.yml run --rm --entrypoint python3 caldav-mirror tools/clear_db.py
 ```
 
-## 💬 License
-
-MIT. Use it, fork it, build something weird with it.
 ## 🧭 Windowed Projection Architecture (Flattened Instances)
 
 This service now treats Google Calendar as a cache of explicitly projected instances over a rolling time window. Instead of mirroring recurrence semantics (RRULE/EXDATE) on Google, each occurrence is created as a standalone event. This eliminates “this and future” splits, EXDATE reconciliation, and other edge cases. Reconciliation becomes pure set arithmetic.
@@ -263,9 +254,13 @@ PROJECTION_WINDOW_FUTURE_MONTHS=18
 # Preview mode (no mutations to Google, no state persisted)
 PROJECTION_DRY_RUN=false
 
-## ❗ Notes and Guarantees
+## ❗ Notes
 
 - Determinism: projection is derived entirely from your CalDAV data and the configured window.
 - Idempotency: identical inputs produce identical outputs; second run with no changes results in zero operations.
 - Ownership: only events carrying our private ownership marker are considered for delete/replace; anything else is treated as unmanaged and removed in dedicated-calendar mode.
 - Hot-Reload: changing PROJECTION_* env vars takes effect on the next cycle without restart.
+
+## 💬 License
+
+MIT. Use it, fork it, build something weird with it.

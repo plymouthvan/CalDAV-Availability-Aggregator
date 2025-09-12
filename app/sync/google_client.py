@@ -9,6 +9,7 @@ import asyncio
 import aiohttp
 import logging
 import json
+import os
 from typing import Dict, Any, Optional, List, Tuple
 import uuid
 
@@ -31,20 +32,47 @@ class GoogleClient:
     def _log_api_call(self, action: str, http_method: str, url: str, payload: Optional[Dict[str, Any]] = None, context: Optional[Dict[str, Any]] = None) -> None:
         """
         Emit a structured JSON log for outbound Google Calendar API calls.
+        Quiet by default: logs only a payload summary at INFO.
+        Set GOOGLE_API_LOG_VERBOSE=true to include full payloads.
         """
         try:
+            verbose = str(os.getenv("GOOGLE_API_LOG_VERBOSE", "false")).lower() in ("1", "true", "yes", "on")
             log_obj = {
                 "type": "API_CALL",
                 "action": action,
                 "http_method": http_method,
                 "url": url,
                 "calendar_id": self.calendar_id,
-                "payload": payload,
                 "context": context or {}
             }
+            if verbose:
+                log_obj["payload"] = payload
+            else:
+                log_obj["payload_summary"] = self._summarize_payload(action, payload)
             logger.info(json.dumps(log_obj, default=str))
         except Exception:
             logger.debug(f"[API_CALL][{action}] Failed to serialize payload for logging.")
+    
+    def _summarize_payload(self, action: str, payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Create a compact summary for API payloads to keep logs readable.
+        - For batch operations: include counts only
+        - For others: include serialized size
+        """
+        try:
+            if payload is None:
+                return None
+            if isinstance(payload, dict):
+                if "parts" in payload:
+                    parts = payload.get("parts") or []
+                    return {"parts_count": len(parts)}
+                if "ids" in payload:
+                    ids = payload.get("ids") or []
+                    return {"ids_count": len(ids)}
+            # Fallback: just report approximate size in bytes
+            return {"size_bytes": len(json.dumps(payload, default=str))}
+        except Exception:
+            return {"summary": "unserializable"}
 
     async def _get_auth_headers(self) -> Dict[str, str]:
         """Get authorization headers with a valid access token."""
