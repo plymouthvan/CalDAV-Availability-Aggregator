@@ -58,6 +58,7 @@ venv/
 ENV/
 env.bak
 venv.bak
+.vscode/
 
 # Project-specific ignores
 # -------------------------
