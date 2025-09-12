@@ -476,7 +476,7 @@ class GoogleClient:
             'orderBy': "startTime" if single_events else None,
             'showDeleted': "false",
             'maxResults': 2500,
-            'fields': 'items(id,iCalUID,recurringEventId,originalStartTime,recurrence,status,start,end,summary,extendedProperties/private),nextPageToken',
+            'fields': 'items(id,iCalUID,recurringEventId,originalStartTime,recurrence,status,start,end,summary,description,location,extendedProperties/private),nextPageToken',
         }
         items = await self._list_events_paginated(params)
         logger.info(f"Found {len(items)} items in window.")

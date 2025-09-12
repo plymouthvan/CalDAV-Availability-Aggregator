@@ -35,7 +35,8 @@ logger = logging.getLogger(__name__)
 # --------- Helpers ---------
 
 def _rfc3339_z(dt_utc: datetime) -> str:
-    return dt_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    dt_utc = dt_utc.astimezone(timezone.utc).replace(microsecond=0)
+    return dt_utc.isoformat().replace("+00:00", "Z")
 
 def _parse_yyyy_mm_dd(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
@@ -100,6 +101,28 @@ def _clamp_int(val: int, lo: int, hi: int, name: str) -> int:
         return hi
     return val
 
+def _norm_text(text: Optional[str]) -> Optional[str]:
+    """
+    Canonicalize free-text fields to avoid churn between DB and Google:
+    - Normalize line endings to LF
+    - Convert NBSP variants to regular spaces
+    - Trim trailing whitespace on each line
+    - Strip leading/trailing whitespace
+    - Collapse to None when empty after normalization
+    """
+    if text is None:
+        return None
+    s = str(text)
+    # Normalize line endings
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # Replace non-breaking spaces with regular spaces
+    s = s.replace("\u00A0", " ").replace("\u202F", " ")
+    # Trim trailing whitespace on each line
+    s = "\n".join(line.rstrip() for line in s.split("\n"))
+    # Strip overall
+    s = s.strip()
+    return s if s else None
+
 # --------- Projected Event (flattened instance) ---------
 
 @dataclass
@@ -134,25 +157,32 @@ class ProjectedEvent:
         return f"{self.uid}#{s}#{e}"
 
     def to_google_event(self) -> Dict[str, Any]:
+        # Normalize text to match Google's stored representation and stabilize hashes
+        norm_summary = _norm_text(self.summary) or ""
+        norm_description = _norm_text(self.description)
+        norm_location = _norm_text(self.location)
+
         body: Dict[str, Any] = {
-            "summary": self.summary or "",
+            "summary": norm_summary,
         }
-        if self.description:
-            body["description"] = self.description
-        if self.location:
-            body["location"] = self.location
+        if norm_description is not None:
+            body["description"] = norm_description
+        if norm_location is not None:
+            body["location"] = norm_location
 
         if self.is_all_day:
             body["start"] = {"date": self.start_date}
             body["end"] = {"date": self.end_date}
         else:
             tzname = self.time_zone or "UTC"
+            sdt = self.start_dt.replace(microsecond=0)
+            edt = self.end_dt.replace(microsecond=0)
             body["start"] = {
-                "dateTime": self.start_dt.isoformat().replace("+00:00", "Z") if self.start_dt.tzinfo == timezone.utc else self.start_dt.isoformat(),
+                "dateTime": sdt.isoformat().replace("+00:00", "Z") if sdt.tzinfo == timezone.utc else sdt.isoformat(),
                 "timeZone": tzname
             }
             body["end"] = {
-                "dateTime": self.end_dt.isoformat().replace("+00:00", "Z") if self.end_dt.tzinfo == timezone.utc else self.end_dt.isoformat(),
+                "dateTime": edt.isoformat().replace("+00:00", "Z") if edt.tzinfo == timezone.utc else edt.isoformat(),
                 "timeZone": tzname
             }
 
@@ -174,24 +204,30 @@ class ProjectedEvent:
         """
         Fingerprint of the canonical projected instance payload.
         Only fields that we push to Google and expect to remain stable.
+        Notes:
+        - Excludes timeZone to avoid churn when Google omits/normalizes it but preserves absolute times.
+        - Normalizes free-text fields to align with Google's stored representation.
         """
+        norm_summary = _norm_text(self.summary) or ""
+        norm_description = _norm_text(self.description)
+        norm_location = _norm_text(self.location)
+
         if self.is_all_day:
             core = {
-                "summary": self.summary or "",
-                "description": self.description or None,
-                "location": self.location or None,
+                "summary": norm_summary,
+                "description": norm_description,
+                "location": norm_location,
                 "start_date": self.start_date,
                 "end_date": self.end_date,
-                "visibility": "public",  # implicit default we use
+                "visibility": "public",
             }
         else:
             core = {
-                "summary": self.summary or "",
-                "description": self.description or None,
-                "location": self.location or None,
+                "summary": norm_summary,
+                "description": norm_description,
+                "location": norm_location,
                 "start_dt_z": _rfc3339_z(self.start_dt.astimezone(timezone.utc)) if self.start_dt else None,
                 "end_dt_z": _rfc3339_z(self.end_dt.astimezone(timezone.utc)) if self.end_dt else None,
-                "timeZone": self.time_zone or "UTC",
                 "visibility": "public",
             }
         blob = json.dumps(core, sort_keys=True, default=str)
@@ -447,7 +483,8 @@ class WindowReconciler:
                     def _parse_dt(s: Optional[str]) -> Optional[datetime]:
                         if not s:
                             return None
-                        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                        return dt.replace(microsecond=0)
 
                     pe = ProjectedEvent(
                         uid=private.get("caldav-mirror-uid"),
@@ -652,8 +689,8 @@ class WindowReconciler:
             end_dt = ev.end_datetime
             # Ensure aware
             tz = _safe_event_tz(tzname)
-            start_dt = _to_aware_local(start_dt, tz)
-            end_dt = _to_aware_local(end_dt, tz)
+            start_dt = _to_aware_local(start_dt, tz).replace(microsecond=0)
+            end_dt = _to_aware_local(end_dt, tz).replace(microsecond=0)
             return ProjectedEvent(
                 uid=ev.uid,
                 source_name=source_name,
@@ -777,8 +814,8 @@ class WindowReconciler:
                 else:
                     if not duration:
                         continue
-                    start_dt = occ_local
-                    end_dt = start_dt + duration
+                    start_dt = occ_local.replace(microsecond=0)
+                    end_dt = (start_dt + duration).replace(microsecond=0)
                     proj = ProjectedEvent(
                         uid=master.uid,
                         source_name=source_name,
