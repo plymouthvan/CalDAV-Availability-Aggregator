@@ -28,6 +28,87 @@ class SyncManager:
         self.source_name = caldav_client.name
         self.window_reconciler = WindowReconciler(google_client, database)
 
+    def _sort_key_for_new_exception(self, event: EventModel) -> int:
+        """
+        Robust sort key for new exceptions (EventModel instances). Returns epoch seconds UTC.
+        """
+        return self._safe_epoch(
+            dt_val=event.start_datetime,
+            date_str=event.start_date,
+            rid=event.recurrence_id,
+            ctx=f"new:{event.uid}:{event.recurrence_id}"
+        )
+
+    def _sort_key_for_existing_exception(self, row: dict) -> int:
+        """
+        Robust sort key for existing exceptions (DB rows). Returns epoch seconds UTC.
+        """
+        data = (row or {}).get('event_data') or {}
+        return self._safe_epoch(
+            dt_val=data.get('start_datetime'),
+            date_str=data.get('start_date'),
+            rid=data.get('recurrence_id'),
+            ctx=f"old:{row.get('caldav_uid')}:{row.get('recurrence_id')}"
+        )
+
+    def _safe_epoch(self, dt_val, date_str, rid, ctx: str) -> int:
+        """
+        Prefer start_datetime (datetime or ISO string), fallback to start_date (YYYY-MM-DD),
+        then recurrence_id, else epoch(0). Returns integer epoch seconds UTC.
+        Logs fallbacks for diagnostics.
+        """
+        try:
+            from datetime import timezone  # local import to avoid changing module imports
+            # 1) start_datetime
+            if isinstance(dt_val, datetime):
+                try:
+                    d = dt_val
+                    if d.tzinfo is None:
+                        d = d.replace(tzinfo=timezone.utc)
+                    return int(d.astimezone(timezone.utc).timestamp())
+                except Exception:
+                    logger.debug(f"[{self.source_name}] _safe_epoch: failed datetime-&gt;epoch for {ctx}")
+            elif isinstance(dt_val, str) and dt_val:
+                try:
+                    iso = dt_val.replace('Z', '+00:00')
+                    parsed = datetime.fromisoformat(iso)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    return int(parsed.astimezone(timezone.utc).timestamp())
+                except Exception:
+                    logger.warning(f"[{self.source_name}] Non-ISO start_datetime for {ctx}: {dt_val}")
+
+            # 2) start_date (YYYY-MM-DD) at midnight UTC
+            if isinstance(date_str, str) and date_str:
+                try:
+                    d0 = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    logger.debug(f"[{self.source_name}] Fallback sort by start_date for {ctx}: {date_str}")
+                    return int(d0.timestamp())
+                except Exception:
+                    logger.warning(f"[{self.source_name}] Bad start_date for {ctx}: {date_str}")
+
+            # 3) recurrence_id (YYYYMMDD or YYYYMMDDTHHMMSS[Z])
+            if isinstance(rid, str) and rid:
+                try:
+                    if len(rid) == 8 and rid.isdigit():
+                        d1 = datetime.strptime(rid, "%Y%m%d").replace(tzinfo=timezone.utc)
+                    else:
+                        if rid.endswith('Z'):
+                            d1 = datetime.strptime(rid, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+                        else:
+                            d1 = datetime.strptime(rid, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+                    logger.debug(f"[{self.source_name}] Fallback sort by recurrence_id for {ctx}: {rid}")
+                    return int(d1.timestamp())
+                except Exception:
+                    logger.warning(f"[{self.source_name}] Bad recurrence_id for {ctx}: {rid}")
+
+            # 4) ultimate fallback
+            logger.warning(f"[{self.source_name}] Using minimal sort key for {ctx}")
+            epoch0 = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            return int(epoch0.timestamp())
+        except Exception:
+            # Super defensive fallback
+            return 0
     async def run_sync(self):
         """
         Run a full synchronization cycle for the source.
@@ -64,12 +145,25 @@ class SyncManager:
 
                     # Separate master and exceptions for both new and existing events
                     new_master = next((e for e in events_for_uid if e.is_master_event), None)
-                    new_exceptions = sorted([e for e in events_for_uid if not e.is_master_event], key=lambda x: x.start_datetime)
+                    # Diagnostics: enumerate exception timing fields before sorting
+                    try:
+                        new_exc_list = [e for e in events_for_uid if not e.is_master_event]
+                        old_exc_list = [i for i in existing_instances_raw if not i['event_data'].get('is_master_event')]
+                        logger.debug(f"[{self.source_name}] UID {uid}: exception diagnostics: new_count={len(new_exc_list)}, existing_count={len(old_exc_list)}")
+                        for e in new_exc_list:
+                            logger.debug(f"[{self.source_name}] NEW_EXC uid={uid} rid={e.recurrence_id} start_datetime={e.start_datetime} type={(type(e.start_datetime).__name__ if e.start_datetime is not None else 'NoneType')} start_date={e.start_date}")
+                        for irow in old_exc_list:
+                            data = (irow or {}).get('event_data') or {}
+                            sd = data.get('start_datetime')
+                            logger.debug(f"[{self.source_name}] OLD_EXC uid={uid} rid={irow.get('recurrence_id')} start_datetime={sd} type={(type(sd).__name__ if sd is not None else 'NoneType')} start_date={data.get('start_date')}")
+                    except Exception:
+                        logger.debug(f"[{self.source_name}] UID {uid}: exception diagnostics failed")
+                    new_exceptions = sorted([e for e in events_for_uid if not e.is_master_event], key=self._sort_key_for_new_exception)
 
                     existing_master = next((i for i in existing_instances_raw if i['event_data'].get('is_master_event')), None)
                     existing_exceptions = sorted(
                         [i for i in existing_instances_raw if not i['event_data'].get('is_master_event')],
-                        key=lambda x: datetime.fromisoformat(x['event_data']['start_datetime'])
+                        key=self._sort_key_for_existing_exception
                     )
 
                     # 1. Map the master event's Google ID
