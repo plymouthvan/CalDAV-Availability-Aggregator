@@ -44,8 +44,36 @@ def _parse_yyyy_mm_dd(s: str) -> date:
 def _safe_event_tz(tzname: Optional[str]) -> pytz.BaseTzInfo:
     if not tzname:
         return pytz.UTC
+    # Normalize to string; handle tzical and GMT/UTC fixed-offset forms
+    s = str(tzname).strip()
     try:
-        return pytz.timezone(tzname)
+        # Local import to avoid adding a top-level dependency churn
+        import re
+
+        # Unwrap tzical repr like: <tzicalvtz 'GMT-0400'> or <tzicalvtz "GMT-0400">
+        m = re.match(r"^<tzicalvtz\s+['\"]([^'\"]+)['\"]>$", s)
+        if m:
+            s = m.group(1)
+
+        # Match GMT/UTC with HHMM or HH:MM, e.g., GMT-0400, GMT-04:00, UTC+0530, UTC+05:30
+        m = re.match(r"^(?:GMT|UTC)\s*([+-])\s*(\d{2}):?(\d{2})$", s, re.IGNORECASE)
+        if m:
+            sign = 1 if m.group(1) == "+" else -1
+            hh = int(m.group(2))
+            mm = int(m.group(3))
+            offset_min = sign * (hh * 60 + mm)
+            return pytz.FixedOffset(offset_min)
+
+        # Also accept hour-only forms like GMT-4 or UTC+9
+        m = re.match(r"^(?:GMT|UTC)\s*([+-])\s*(\d{1,2})$", s, re.IGNORECASE)
+        if m:
+            sign = 1 if m.group(1) == "+" else -1
+            hh = int(m.group(2))
+            offset_min = sign * (hh * 60)
+            return pytz.FixedOffset(offset_min)
+
+        # Fall back to named timezone parsing
+        return pytz.timezone(s)
     except Exception:
         logger.warning(f"Unknown timezone '{tzname}', falling back to UTC.")
         return pytz.UTC
@@ -123,6 +151,68 @@ def _norm_text(text: Optional[str]) -> Optional[str]:
     s = s.strip()
     return s if s else None
 
+# RRULE helpers for parse-time normalization of UNTIL to UTC when DTSTART is tz-aware
+def _extract_until_token(rrule_str: Optional[str]) -> Optional[str]:
+    if not rrule_str:
+        return None
+    try:
+        parts = [p for p in rrule_str.split(";") if p]
+        for p in parts:
+            if p.upper().startswith("UNTIL="):
+                return p.split("=", 1)[1].strip()
+    except Exception:
+        return None
+    return None
+
+def _normalize_rrule_until_utc(rrule_str: Optional[str], dtstart_local: datetime) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    If RRULE has UNTIL without Z while DTSTART is timezone-aware, convert UNTIL to UTC Z form.
+    Returns (normalized_rrule, until_raw, until_normalized)
+    """
+    if not rrule_str:
+        return rrule_str, None, None
+    until_raw: Optional[str] = None
+    until_norm: Optional[str] = None
+    try:
+        parts = [p for p in rrule_str.split(";") if p]
+        new_parts: List[str] = []
+        tz = getattr(dtstart_local, "tzinfo", None)
+        for p in parts:
+            if p.upper().startswith("UNTIL="):
+                val = p.split("=", 1)[1].strip()
+                until_raw = val
+                # If already UTC Z, keep as-is
+                if isinstance(val, str) and val.endswith("Z"):
+                    until_norm = val
+                    new_parts.append(f"UNTIL={val}")
+                else:
+                    # Convert local or date-only UNTIL to UTC Z
+                    try:
+                        if isinstance(val, str) and len(val) == 8 and val.isdigit():
+                            # YYYYMMDD -> treat as local midnight
+                            dt_naive = datetime.strptime(val, "%Y%m%d")
+                            if hasattr(tz, "localize"):
+                                local_dt = tz.localize(datetime(dt_naive.year, dt_naive.month, dt_naive.day, 0, 0, 0)) if tz else datetime(dt_naive.year, dt_naive.month, dt_naive.day, 0, 0, 0)
+                            else:
+                                local_dt = datetime(dt_naive.year, dt_naive.month, dt_naive.day, 0, 0, 0, tzinfo=tz) if tz else datetime(dt_naive.year, dt_naive.month, dt_naive.day, 0, 0, 0)
+                        else:
+                            # Expect YYYYMMDDTHHMMSS (no Z) -> interpret in event tz
+                            dt_naive = datetime.strptime(val, "%Y%m%dT%H%M%S")
+                            if hasattr(tz, "localize"):
+                                local_dt = tz.localize(dt_naive) if tz else dt_naive
+                            else:
+                                local_dt = dt_naive.replace(tzinfo=tz) if tz else dt_naive
+                        until_z = local_dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                        until_norm = until_z
+                        new_parts.append(f"UNTIL={until_z}")
+                    except Exception:
+                        # Fallback to original token unchanged
+                        new_parts.append(p)
+            else:
+                new_parts.append(p)
+        return ";".join(new_parts), until_raw, until_norm
+    except Exception:
+        return rrule_str, None, None
 # --------- Projected Event (flattened instance) ---------
 
 @dataclass
@@ -744,7 +834,39 @@ class WindowReconciler:
         # Build rruleset with EXDATEs
         rset = rrule.rruleset()
         try:
-            r = rrule.rrulestr(master.rrule, dtstart=dtstart_local)
+            # Diagnostics: capture RRULE and UNTIL before normalization
+            until_token = _extract_until_token(master.rrule)
+            try:
+                logger.info(json.dumps({
+                    "type": "RRULE_DIAG",
+                    "source": source_name,
+                    "uid": master.uid,
+                    "timezone": getattr(tz, "zone", str(tz)),
+                    "dtstart_local": dtstart_local.isoformat(),
+                    "rrule_raw": master.rrule,
+                    "until_raw": until_token
+                }))
+            except Exception:
+                pass
+
+            rrule_input = master.rrule
+            # Normalize UNTIL to UTC Z when DTSTART is tz-aware
+            if dtstart_local.tzinfo is not None:
+                rrule_norm, until_raw2, until_norm2 = _normalize_rrule_until_utc(master.rrule, dtstart_local)
+                rrule_input = rrule_norm
+                try:
+                    logger.info(json.dumps({
+                        "type": "RRULE_NORMALIZE",
+                        "source": source_name,
+                        "uid": master.uid,
+                        "until_raw": until_raw2,
+                        "until_norm": until_norm2,
+                        "changed": bool(until_norm2 and until_raw2 and until_norm2 != until_raw2)
+                    }))
+                except Exception:
+                    pass
+
+            r = rrule.rrulestr(rrule_input, dtstart=dtstart_local)
             rset.rrule(r)
         except Exception as e:
             logger.warning(f"Failed to parse RRULE for UID={master.uid}: {e}")
