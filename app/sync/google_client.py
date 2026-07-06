@@ -12,6 +12,9 @@ import json
 import os
 from typing import Dict, Any, Optional, List, Tuple
 import uuid
+import asyncio
+
+MAX_BATCH_SIZE = 50
 
 from .event_model import EventModel
 from auth.google_oauth import GoogleOAuth
@@ -476,7 +479,7 @@ class GoogleClient:
             'orderBy': "startTime" if single_events else None,
             'showDeleted': "false",
             'maxResults': 2500,
-            'fields': 'items(id,iCalUID,recurringEventId,originalStartTime,recurrence,status,start,end,summary,description,location,extendedProperties/private),nextPageToken',
+            'fields': 'items(id,iCalUID,recurringEventId,originalStartTime,recurrence,status,start,end,summary,description,location,transparency,extendedProperties/private),nextPageToken',
         }
         items = await self._list_events_paginated(params)
         logger.info(f"Found {len(items)} items in window.")
@@ -556,55 +559,53 @@ class GoogleClient:
         return items
     async def batch_create_events(self, events: List[EventModel]) -> Dict[Tuple[str, Optional[str]], str]:
         if not events: return {}
-        logger.info(f"Batch creating {len(events)} Google events...")
+        logger.info(f"Batch creating {len(events)} Google events (chunked to {MAX_BATCH_SIZE})...")
         batch_url = "https://www.googleapis.com/batch/calendar/v3"
         headers = await self._get_auth_headers()
         headers["Content-Type"] = "multipart/mixed; boundary=batch_boundary"
 
-        body = ""
-        payloads: List[Dict[str, Any]] = []
-        for event in events:
-            event_data = event.to_google_event()
-            payloads.append(event_data)
-            logger.debug(f"Batch Create Payload for UID {event.uid}: {json.dumps(event_data, indent=2)}")
-            if event.is_master_event:
-                logger.debug(f"  Master Event Details: UID={event.uid}, Recurrence={event_data.get('recurrence')}")
-            elif event.recurrence_id:
-                logger.debug(f"  Exception Details: UID={event.uid}, RecurrenceID={event.recurrence_id}, recurringEventId={event_data.get('recurringEventId')}")
-                # DIAG: Exceptions should include originalStartTime to suppress the generated instance
-                if 'originalStartTime' not in event_data:
-                    logger.warning(f"[Google PUSH][DIAG] Batch create exception missing originalStartTime: UID={event.uid}, RecurrenceID={event.recurrence_id}, recurringEventId={event_data.get('recurringEventId')}")
-                else:
-                    logger.debug(f"[Google PUSH][DIAG] Batch create exception has originalStartTime: UID={event.uid}, RecurrenceID={event.recurrence_id}, originalStartTime={event_data.get('originalStartTime')}")
-            body += "--batch_boundary\n"
-            body += "Content-Type: application/http\n"
-            body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
-            body += f"POST /calendar/v3/calendars/{self.calendar_id}/events\n"
-            body += "Content-Type: application/json\n\n"
-            body += json.dumps(event_data) + "\n"
-        body += "--batch_boundary--"
+        all_results = {}
+        for i in range(0, len(events), MAX_BATCH_SIZE):
+            chunk = events[i:i + MAX_BATCH_SIZE]
+            
+            body = ""
+            payloads: List[Dict[str, Any]] = []
+            for event in chunk:
+                event_data = event.to_google_event()
+                payloads.append(event_data)
+                
+                body += "--batch_boundary\n"
+                body += "Content-Type: application/http\n"
+                body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
+                body += f"POST /calendar/v3/calendars/{self.calendar_id}/events?sendUpdates=none\n"
+                body += "Content-Type: application/json\n\n"
+                body += json.dumps(event_data) + "\n"
+            body += "--batch_boundary--"
 
-        # Structured API_CALL payload log (batch)
-        self._log_api_call(
-            action="batch/events.insert",
-            http_method="POST",
-            url=batch_url,
-            payload={"parts": payloads},
-            context={"count": len(events)}
-        )
+            self._log_api_call(
+                action="batch/events.insert",
+                http_method="POST",
+                url=batch_url,
+                payload={"parts": payloads},
+                context={"count": len(chunk), "chunk": f"{(i//MAX_BATCH_SIZE)+1}/{(len(events)-1)//MAX_BATCH_SIZE + 1}"}
+            )
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(batch_url, data=body.encode('utf-8'), headers=headers) as response:
-                    if response.status == 200:
-                        return await self._parse_batch_create_response(response, events)
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"Batch create failed: {response.status} - {error_text}")
-                        return {}
-        except Exception as e:
-            logger.error(f"Error in batch create: {e}", exc_info=True)
-            return {}
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(batch_url, data=body.encode("utf-8"), headers=headers) as response:
+                        if response.status == 200:
+                            chunk_results = await self._parse_batch_create_response(response, chunk)
+                            all_results.update(chunk_results)
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"Batch create chunk failed: {response.status} - {error_text}")
+            except Exception as e:
+                logger.error(f"Error in batch create chunk: {e}", exc_info=True)
+                
+            if i + MAX_BATCH_SIZE < len(events):
+                await asyncio.sleep(0.5)
+
+        return all_results
 
     async def _parse_batch_create_response(self, response: aiohttp.ClientResponse, original_events: List[EventModel]) -> Dict[Tuple[str, Optional[str]], str]:
         """Parse the multipart/mixed response from a batch request."""
@@ -718,98 +719,48 @@ class GoogleClient:
 
     async def batch_delete_events(self, google_event_ids: List[str]) -> bool:
         if not google_event_ids: return True
-        logger.info(f"Batch deleting {len(google_event_ids)} Google events...")
+        logger.info(f"Batch deleting {len(google_event_ids)} Google events (chunked to {MAX_BATCH_SIZE})...")
         batch_url = "https://www.googleapis.com/batch/calendar/v3"
         headers = await self._get_auth_headers()
         headers["Content-Type"] = "multipart/mixed; boundary=batch_boundary"
 
-        body = ""
-        for google_event_id in google_event_ids:
-            body += "--batch_boundary\n"
-            body += "Content-Type: application/http\n"
-            body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
-            body += f"DELETE /calendar/v3/calendars/{self.calendar_id}/events/{google_event_id}?sendUpdates=none\n"
-        body += "--batch_boundary--"
+        all_success = True
+        for i in range(0, len(google_event_ids), MAX_BATCH_SIZE):
+            chunk = google_event_ids[i:i + MAX_BATCH_SIZE]
+            
+            body = ""
+            for google_event_id in chunk:
+                body += "--batch_boundary\n"
+                body += "Content-Type: application/http\n"
+                body += "Content-ID: <item{}>\n\n".format(uuid.uuid4())
+                body += f"DELETE /calendar/v3/calendars/{self.calendar_id}/events/{google_event_id}?sendUpdates=none\n"
+            body += "--batch_boundary--"
 
-        # Structured API_CALL payload log (batch delete)
-        self._log_api_call(
-            action="batch/events.delete",
-            http_method="POST",
-            url=batch_url,
-            payload={"ids": google_event_ids},
-            context={"count": len(google_event_ids)}
-        )
+            self._log_api_call(
+                action="batch/events.delete",
+                http_method="POST",
+                url=batch_url,
+                payload={"ids": chunk},
+                context={"count": len(chunk), "chunk": f"{(i//MAX_BATCH_SIZE)+1}/{(len(google_event_ids)-1)//MAX_BATCH_SIZE + 1}"}
+            )
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(batch_url, data=body.encode('utf-8'), headers=headers) as response:
-                    response_text = await response.text()
-                    if response.status == 200:
-                        logger.info(f"Batch delete successful.")
-                        logger.debug(f"Response: {response_text}")
-                        return True
-                    else:
-                        logger.error(f"Batch delete failed: {response.status} - {response_text}")
-                        return False
-        except Exception as e:
-            logger.error(f"Error in batch delete: {e}", exc_info=True)
-            return False
-    async def list_owned_events_in_window(self, source_name: str, time_min: str, time_max: str) -> Tuple[Dict[Tuple[str, Optional[str]], EventModel], Dict[Tuple[str, Optional[str]], Dict[str, Any]]]:
-        """
-        Return our owned events within a window, keyed by (uid, recurrence_id).
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(batch_url, data=body.encode("utf-8"), headers=headers) as response:
+                        if response.status == 200:
+                            logger.debug("Batch delete chunk successful.")
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"Batch delete chunk failed: {response.status} - {error_text}")
+                            all_success = False
+            except Exception as e:
+                logger.error(f"Error in batch delete chunk: {e}", exc_info=True)
+                all_success = False
+                
+            if i + MAX_BATCH_SIZE < len(google_event_ids):
+                await asyncio.sleep(0.5)
 
-        Filters by extendedProperties.private.caldav-mirror-source == source_name and status != CANCELLED.
-        """
-        items = await self.list_events_window(time_min, time_max, single_events=True)
-        models: Dict[Tuple[str, Optional[str]], EventModel] = {}
-        raws: Dict[Tuple[str, Optional[str]], Dict[str, Any]] = {}
-        for it in items:
-            status = (it.get('status') or '').upper()
-            if status == 'CANCELLED':
-                continue
-            private = ((it.get('extendedProperties') or {}).get('private')) or {}
-            if private.get('caldav-mirror-source') != source_name:
-                continue
-            model = EventModel.from_google_event(it)
-            if not model or not model.uid:
-                continue
-            key = (model.uid, model.recurrence_id)
-            models[key] = model
-            raws[key] = it
-        return models, raws
-
-    async def fetch_next_sync_token(self) -> Optional[str]:
-        """
-        Perform a full incremental baseline scan to obtain nextSyncToken for the calendar.
-        This is a lightweight scan (fields limited). Returns the token or None.
-        """
-        url = f"{self.API_BASE_URL}/calendars/{self.calendar_id}/events"
-        headers = await self._get_auth_headers()
-        params: Dict[str, Any] = {
-            'showDeleted': "true",
-            'maxResults': 2500,
-            # Limit fields for speed: only need pagination + token + minimal items
-            'fields': 'nextPageToken,nextSyncToken,items/id'
-        }
-
-        next_page = None
-        try:
-            async with aiohttp.ClientSession() as session:
-                while True:
-                    if next_page:
-                        params['pageToken'] = next_page
-                    async with session.get(url, headers=headers, params=params) as resp:
-                        if resp.status != 200:
-                            txt = await resp.text()
-                            logger.error(f"fetch_next_sync_token failed: {resp.status} - {txt}")
-                            return None
-                        data = await resp.json()
-                        next_page = data.get('nextPageToken')
-                        if not next_page:
-                            return data.get('nextSyncToken')
-        except Exception as e:
-            logger.error(f"Error in fetch_next_sync_token: {e}", exc_info=True)
-            return None
+        return all_success
 
     async def has_changes_since(self, sync_token: str) -> Tuple[bool, Optional[str]]:
         """

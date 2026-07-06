@@ -234,6 +234,7 @@ class ProjectedEvent:
     recurrence_id: Optional[str] = None
     is_master_event: bool = False
     google_event_id: Optional[str] = None
+    transparency: str = "OPAQUE"
 
     def instance_key(self) -> str:
         """Stable key: uid + final start + final end in UTC or date form."""
@@ -276,6 +277,9 @@ class ProjectedEvent:
                 "timeZone": tzname
             }
 
+        body["transparency"] = "transparent" if self.transparency == "TRANSPARENT" else "opaque"
+
+
         # No recurrence semantics; each instance is standalone
         # Ownership and integrity tags
         contents_hash = self.compute_hash()
@@ -310,6 +314,7 @@ class ProjectedEvent:
                 "start_date": self.start_date,
                 "end_date": self.end_date,
                 "visibility": "public",
+                "transparency": self.transparency,
             }
         else:
             core = {
@@ -319,6 +324,7 @@ class ProjectedEvent:
                 "start_dt_z": _rfc3339_z(self.start_dt.astimezone(timezone.utc)) if self.start_dt else None,
                 "end_dt_z": _rfc3339_z(self.end_dt.astimezone(timezone.utc)) if self.end_dt else None,
                 "visibility": "public",
+                "transparency": self.transparency,
             }
         blob = json.dumps(core, sort_keys=True, default=str)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -564,6 +570,7 @@ class WindowReconciler:
                         start_dt=None,
                         end_dt=None,
                         time_zone=None,
+                        transparency=("TRANSPARENT" if str(it.get("transparency", "opaque")).lower() == "transparent" else "OPAQUE"),
                     )
                 else:
                     dt_s = start.get("dateTime")
@@ -588,6 +595,7 @@ class WindowReconciler:
                         start_dt=_parse_dt(dt_s),
                         end_dt=_parse_dt(dt_e),
                         time_zone=tzname,
+                        transparency=("TRANSPARENT" if str(it.get("transparency", "opaque")).lower() == "transparent" else "OPAQUE"),
                     )
                 observed_hash = pe.compute_hash()
             except Exception:
@@ -771,6 +779,7 @@ class WindowReconciler:
                 start_dt=None,
                 end_dt=None,
                 time_zone=None,
+                transparency=ev.transparency,
             )
         # Timed
         if ev.start_datetime and ev.end_datetime:
@@ -792,7 +801,8 @@ class WindowReconciler:
                 end_date=None,
                 start_dt=start_dt,
                 end_dt=end_dt,
-                time_zone=tzname
+                time_zone=tzname,
+                transparency=ev.transparency
             )
         return None
 
@@ -931,7 +941,8 @@ class WindowReconciler:
                         end_date=e_date.strftime("%Y-%m-%d"),
                         start_dt=None,
                         end_dt=None,
-                        time_zone=None
+                        time_zone=None,
+                        transparency=master.transparency,
                     )
                 else:
                     if not duration:
@@ -949,7 +960,8 @@ class WindowReconciler:
                         end_date=None,
                         start_dt=start_dt,
                         end_dt=end_dt,
-                        time_zone=master.timezone or getattr(occ_local.tzinfo, "zone", "UTC")
+                        time_zone=master.timezone or getattr(occ_local.tzinfo, "zone", "UTC"),
+                        transparency=master.transparency,
                     )
 
                 if self._instance_in_window(proj, ws_dt, we_dt):
